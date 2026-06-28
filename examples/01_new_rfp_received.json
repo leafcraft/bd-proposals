@@ -1,0 +1,13 @@
+{
+  "_entry_point": "manual_action",
+  "_description": "RFP arrives from a regional government \u2014 rfp_intake extracts key requirements, precedent_research finds 2 similar prior wins.",
+  "payload": {
+    "rfp_id": "RFP-2026-08813",
+    "client_org": "State Department of Transportation \u2014 Region IV",
+    "received_at_utc": "2026-06-04T11:00:00Z",
+    "deadline_utc": "2026-07-09T17:00:00Z",
+    "practice_area": "infrastructure_advisory",
+    "estimated_value_cents": 95000000,
+    "scope_summary": "Five-year roadmap consulting for I-95 corridor modernisation \u2014 traffic modelling, environmental review, federal funding strategy."
+  }
+}

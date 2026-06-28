@@ -1,0 +1,16 @@
+{
+  "_entry_point": "competitor_takeaway",
+  "_description": "Lost to a known competitor \u2014 focused analysis on price, scope, and timing trade-offs.",
+  "payload": {
+    "rfp_id": "RFP-2026-07734",
+    "client_org": "Midwest Healthcare Alliance",
+    "outcome": "lost",
+    "winning_competitor": "GlobalAdvise Partners",
+    "deal_value_cents": 28500000,
+    "loss_reasons_known": [
+      "winning_bid_price_lower_pct: 14",
+      "incumbent_relationship: 3_years"
+    ],
+    "client_feedback_received": "Quote was strong on methodology; bid was 14% above the winner."
+  }
+}

@@ -1,0 +1,1136 @@
+# bd-proposals — Business Development Proposals
+#
+# bd × services, YAML-FIRST. opportunity_feed pulls new opportunities
+# from YOUR capture tool (GovWin / SAM.gov saved searches — n8n
+# connector) → rfp_intake normalises + extracts requirements →
+# precedent research (prior wins + proposal-library RAG) → section
+# draft → pricing → contracts review → close. Competitor signals live
+# in YOUR CRM via the signal-ledger connector. Legal contracts
+# reviewer + practice lead HITL on pricing.
+
+name: "bd-proposals"
+version: "1.0.0"
+architecture: "managed_mesh"
+environment: "development"
+debug: true
+log_level: "INFO"
+
+redis:
+  host: "${REDIS_HOST:localhost}"
+  port: ${REDIS_PORT:6379}
+  db: 0
+  password: "${REDIS_PASSWORD:}"
+  auto_storage: true
+  decode_responses: true
+  default_ttl: 86400
+  session_ttl: 2592000
+
+auto_discover:
+  directory: "./agency"
+  pattern: "*_agent.py"
+  recursive: false
+
+manager:
+  enabled: true
+  model: "gpt-4o-mini"
+  domain: "generic"
+  can_intervene: true
+  prompt: |
+    BD/proposals mesh. Successful turn:
+      - opportunity_feed pulls new, pre-deduplicated opportunities
+        from the firm's capture tool (GovWin / SAM.gov / FedConnect
+        saved searches) via its connector; high-fit finds go straight
+        to the partner
+      - rfp_intake normalises inbound RFPs AND extracts structured
+        requirements from any attachments (one intake role, two
+        responsibilities)
+      - precedent_research pulls similar prior wins and the best
+        archive matches from the proposal-library knowledge group
+        (the firm's DMS) as RAG context for drafting
+      - section_drafter writes each required section
+      - pricing_configurator builds pricing within rate-card bands
+      - contracts_review checks legal / regulatory fit AND reviews
+        contract clauses against the firm playbook (mode-dispatched)
+      - competitive_intel runs win/loss post-mortems; competitor
+        signals are archived to / queried from the firm's CRM via
+        competitor_signal_ledger (connector)
+      - practice lead / partner / legal HITL chain
+
+    Escalate when:
+      - RFP requires regulated industry experience we lack
+      - pricing outside discount band > 20%
+      - compliance flag (NDA, IP, data residency, regulator)
+
+  routing:
+    mode: "learning"
+    memory_size: 200
+    confidence_threshold: 0.7
+    fallback: "all"
+    decay_days: 30
+
+  knowledge:
+    serviceName: "mongo_main"
+    enabled: true
+    groupName: "proposals_playbook"
+
+  escalation:
+    targets:
+      - type: "human_agent"
+        agent: "partner_human"
+      - type: "webhook"
+        url: "${PAGER_WEBHOOK:https://events.pagerduty.com/v2/enqueue}"
+        method: "POST"
+        headers:
+          Content-Type: "application/json"
+        payload_template:
+          incident_id: "{{rfp_id}}"
+          severity: "{{severity}}"
+          message: "{{message}}"
+          session_id: "{{session_id}}"
+      - type: "channel"
+        provider: "slack"
+        channel_id: "${SLACK_BD_CHANNEL:}"
+        message_template: "[bd] {{message}} — rfp {{rfp_id}}"
+    auto_escalate:
+      max_retries: 2
+      max_errors_per_session: 3
+      timeout_threshold: 2
+
+  health_check_interval: 60
+  agent_timeout_threshold: 300
+  chain_completion_timeout: 600
+
+mesh:
+  call_timeout: 120
+
+data_structures:
+  RFP:
+    type: "object"
+    properties:
+      rfp_id: { type: "string" }
+      client_org: { type: "string" }
+      practice_area: { type: "string" }
+      due_date: { type: "string" }
+      budget_range_cents: { type: "object" }
+      compliance_required: { type: "list" }
+      received_at_utc: { type: "string" }
+    required: ["rfp_id"]
+
+entry_points:
+  - name: "rfp_email"
+    target: "rfp_intake_agent"
+    description: "RFP arrived via email"
+
+  - name: "rfp_portal_upload"
+    target: "rfp_intake_agent"
+    description: "RFP uploaded via vendor portal"
+
+  - name: "partner_referral"
+    target: "rfp_intake_agent"
+    description: "Partner-sourced opportunity"
+
+  - name: "manual_action"
+    target: "rfp_intake_agent"
+    description: "BD-initiated"
+
+  - name: "competitor_signal_ingest"
+    target: "competitor_signal_ledger_agent"
+    description: "Record one competitor signal in the CRM ledger (ingest mode)"
+
+  - name: "competitor_intel_query"
+    target: "competitor_signal_ledger_agent"
+    description: "Query the CRM competitor ledger — by competitor or by horizon"
+
+  - name: "bid_no_bid_review"
+    target: "bid_no_bid_decisioner_agent"
+    description: "Pre-bid go/no-go decisioning on an RFP"
+
+  - name: "decision_received"
+    target: "competitive_intel_agent"
+    description: "RFP decision (won/lost) — produce structured post-mortem"
+
+  - name: "competitor_takeaway"
+    target: "competitive_intel_agent"
+    description: "Known competitor won — focused intel write-up + counter-strategy"
+
+  - name: "quarterly_win_rate_review"
+    target: "competitive_intel_agent"
+    description: "QBR cadence — aggregate win/loss patterns for sales leadership"
+
+
+# ── Direct-call entry points (every non-human, non-terminal
+#    agent is API-addressable; bypasses the upstream chain).
+#    Use for ad-hoc invocation, debugging, programmatic ingest.
+  - name: "direct_call_precedent_research"
+    target: "precedent_research_agent"
+    description: "On-demand precedent research (prior wins + proposal-library matches) — bypasses upstream chain"
+
+  - name: "direct_call_section_drafter"
+    target: "section_drafter_agent"
+    description: "On-demand direct call to section_drafter (llm) — bypasses upstream chain"
+
+  - name: "direct_call_pricing_configurator"
+    target: "pricing_configurator_agent"
+    description: "On-demand direct call to pricing_configurator (llm) — bypasses upstream chain"
+
+  - name: "direct_call_contracts_review"
+    target: "contracts_review_agent"
+    description: "On-demand regulatory-fit review (regulatory mode) — bypasses upstream chain"
+
+  - name: "contract_playbook_review"
+    target: "contracts_review_agent"
+    description: "Playbook review of a draft contract — clause-by-clause (playbook mode)"
+
+  - name: "rfp_scout_daily"
+    target: "opportunity_feed_agent"
+    description: "Feed sweep — pulls new opportunities from your GovWin / SAM.gov watchlist (cron once the connector is wired)"
+
+  - name: "rfp_scout_manual"
+    target: "opportunity_feed_agent"
+    description: "Manual RFP discovery sweep — partner-initiated"
+
+  - name: "direct_call_rfp_extraction"
+    target: "rfp_intake_agent"
+    description: "Parse RFP attachments → structured requirements"
+
+  - name: "direct_call_assemble_proposal"
+    target: "proposal_assembler_agent"
+    description: "Render the APPROVED proposal package into a real document (PDF/Markdown) — bypasses the chain (fail-closed on unapproved input)"
+
+
+agents:
+
+  # ────────────────────────────────────────────────────────────
+  # opportunity_feed_agent — the firm's opportunity feed,
+  # connector-only (NO Python). The watchlist, saved searches and
+  # dedup live where they already live for a real BD team: the
+  # capture tool (GovWin saved search, SAM.gov saved search,
+  # FedConnect alerts). One n8n workflow queries those feeds and
+  # returns only NEW notices — the portal tracks what you've seen,
+  # so no template-side dedup ledger is needed.
+  # ────────────────────────────────────────────────────────────
+  opportunity_feed_agent:
+    name: "opportunity_feed_agent"
+    agent_type: "programmatic"
+    description: "Opportunity feed — pulls new, pre-deduplicated RFP notices from the firm's capture tool (GovWin / SAM.gov / FedConnect) via n8n"
+    communication_type: "chain"
+    integration: "n8n"
+    connector_config:
+      # n8n workflow that queries YOUR GovWin / SAM.gov / FedConnect
+      # saved searches and returns only new, fit-scored notices.
+      webhook_url: "${OPPORTUNITY_FEED_WEBHOOK_URL:}"
+      auth_token: "${OPPORTUNITY_FEED_AUTH_TOKEN:}"
+    # wake_up: "0 6 * * *"   # enable after wiring your GovWin/SAM.gov connector
+    yields:
+      # Returned by your capture-tool workflow (lenient-filled when absent)
+      discovered_count: "number"
+      discovered_rfps: "list"
+      high_fit_count: "number"
+      high_fit_rfps: "list"
+      skipped_duplicates: "number"
+      requires_partner_review: "boolean"
+      swept_at_utc: "string"
+    inputs:
+      trigger: "string"
+    can_call:
+      - agent: "partner_human"
+        condition: "calling_agent_response.requires_partner_review == true"
+      - agent: "bd_audit_logger_agent"
+        condition: "calling_agent_response.requires_partner_review == false"
+    narration: |
+      If a discovered opportunity obviously matches an active pursuit
+      or a named client relationship, also consider rfp_intake_agent
+      to normalise it immediately rather than waiting for partner
+      triage.
+
+  # ────────────────────────────────────────────────────────────
+  # rfp_intake_agent — ONE opportunity-intake role. Backed by
+  # agency/rfp_intake_agent.py:
+  #   @pre_compose pulls the captured opportunity record (its declared
+  #                compliance must-haves + budget) from the dev store.
+  #   @chain       RECOMPUTES completeness_score from the extracted
+  #                fields (exact rubric) and derives extraction_complete,
+  #                and UNIONS the captured compliance must-haves into
+  #                compliance_required — a compliance obligation is never
+  #                silently dropped and a thin extraction can't be marked
+  #                "complete" to skip the partner review.
+  # Responsibilities: (1) inbound RFP normalisation, (2) structured
+  # requirements extraction from attachments.
+  # ────────────────────────────────────────────────────────────
+  rfp_intake_agent:
+    name: "rfp_intake_agent"
+    agent_type: "llm"
+    description: "Opportunity intake — normalises inbound RFPs and extracts structured requirements from attachments"
+    model: "gpt-4o-mini"
+    temperature: 0.1
+    max_tokens: 3000
+    communication_type: "chain"
+
+    prompt: |
+      You are the firm's opportunity-intake specialist — the single
+      role that turns an inbound RFP (email / portal / referral /
+      manual, or a discovery handed over by the opportunity feed)
+      into a normalised, structured record the rest of the mesh can
+      work. context["prepared_data"] carries the captured opportunity
+      record (its declared compliance must-haves + budget) when we
+      already know this RFP — reconcile against it. A code floor then
+      RECOMPUTES completeness and UNIONS the captured compliance
+      must-haves, so extract honestly.
+
+      Responsibilities (one pass, both always):
+
+      1. RFP NORMALISATION — extract "client_org", "practice_area",
+         "due_date" and "budget_range_cents" (object; {} when not
+         stated). Echo the input's rfp_id VERBATIM into "rfp_id";
+         if the input carries no rfp_id, generate one of the form
+         rfp- followed by 10 lowercase hex characters. List
+         "compliance_required" (NDA, GDPR, SOC2, HIPAA, FedRAMP,
+         etc.). Detect "deal_breakers" — we don't do that industry /
+         can't meet timeline / impossible scope; [] when none.
+
+      2. REQUIREMENTS EXTRACTION — from the attachments (PDFs / spec
+         sheets / redlines); skip gracefully when the RFP arrived
+         with no documents:
+           - "document_count": the EXACT number of documents in the
+             input (0 when none).
+           - "requirements": list of {text, level}. Classify level
+             from the requirement's own wording: "shall" / "must" /
+             "is required" → must; "should" / "is expected" /
+             "preferred" → should; everything else → may.
+           - "requirements_must_count" / "requirements_should_count":
+             EXACT counts of must / should entries in "requirements".
+           - "compliance_frameworks": sorted, deduplicated framework
+             names found in the documents (SOC 2, HIPAA, FedRAMP,
+             GDPR, PCI-DSS, ISO 27001, CMMC, FERPA, ...).
+           - "deliverables": list. "evaluation_criteria": object
+             (criterion → weight or description).
+             "pricing_constraints": object (max_value_usd, format,
+             ...). "key_dates": object (proposal_due, contract_start,
+             ...). Use [] / {} when the documents don't state them.
+
+      3. COMPLETENESS VERDICT — compute "completeness_score" 0..1 as
+         the EXACT sum of: +0.20 if requirements is non-empty, +0.20
+         if deliverables is non-empty, +0.20 if evaluation_criteria
+         is non-empty, +0.20 if pricing_constraints is non-empty,
+         +0.10 if key_dates is non-empty, +0.10 if
+         compliance_frameworks is non-empty. Set
+         "extraction_complete" to true when completeness_score >=
+         0.6, OR — vacuously — when the RFP arrived with no
+         documents (a body-only RFP keeps flowing down the chain);
+         otherwise false (a partner reviews before drafting starts).
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+      {"rfp_id": "", "client_org": "", "practice_area": "", "due_date": "", "budget_range_cents": {}, "compliance_required": [], "deal_breakers": [], "document_count": 0, "requirements": [], "requirements_must_count": 0, "requirements_should_count": 0, "compliance_frameworks": [], "deliverables": [], "evaluation_criteria": {}, "pricing_constraints": {}, "key_dates": {}, "completeness_score": 0, "extraction_complete": false}
+
+    enforce_yields: true
+    enforce_yields_retry: 3
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "rfp_templates"
+    yields:
+      rfp_id: "string"
+      client_org: "string"
+      practice_area: "string"
+      due_date: "string"
+      budget_range_cents: "object"
+      compliance_required: "list"
+      deal_breakers: "list"
+      document_count: "number"
+      requirements: "list"
+      requirements_must_count: "number"
+      requirements_should_count: "number"
+      compliance_frameworks: "list"
+      deliverables: "list"
+      evaluation_criteria: "object"
+      pricing_constraints: "object"
+      key_dates: "object"
+      completeness_score: "number"
+      extraction_complete: "boolean"
+    inputs:
+      payload: "object"
+      documents: "list"
+      trigger: "string"
+      upstream_yields: "object"
+    can_call:
+      # Deal-breaker found OR attachment extraction incomplete →
+      # partner reviews before any work
+      - agent: "partner_human"
+        condition: "calling_agent_response.deal_breakers != [] or calling_agent_response.extraction_complete == false"
+
+      - agent: "precedent_research_agent"
+        condition: "calling_agent_response.deal_breakers == [] and calling_agent_response.extraction_complete == true"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ────────────────────────────────────────────────────────────
+  # precedent_research_agent — ONE research role. Backed by
+  # agency/precedent_research_agent.py:
+  #   @pre_compose pulls the practice-area precedents from the proposal
+  #                corpus (dev store stand-in for the DMS /
+  #                proposals_library RAG) so the researcher reasons over
+  #                real prior engagements on day 0.
+  #   @chain       DROPS any candidate without an engagement_id (the
+  #                citation floor — no hallucinated proposals reach the
+  #                drafter) and recomputes best_match_* / corpus size /
+  #                high_confidence_match deterministically.
+  # ────────────────────────────────────────────────────────────
+  precedent_research_agent:
+    name: "precedent_research_agent"
+    agent_type: "llm"
+    description: "Precedent research — pulls similar prior wins and the best proposal-library matches as RAG context for drafting"
+    model: "gpt-4o-mini"
+    temperature: 0.0
+    max_tokens: 1000
+    communication_type: "chain"
+    prompt: |
+      You are the firm's precedent researcher — the person who knows
+      what we've already written, won, and signed. Your corpus is
+      the firm's proposal archive in its DMS, indexed into your
+      "proposals_library" knowledge group; context["prepared_data"]
+      also carries the practice-area precedents pre-pulled from that
+      corpus. Retrieve candidates from these; NEVER invent proposals
+      that retrieval did not return — a code floor DROPS any candidate
+      without an engagement_id, so cite every one.
+
+      Responsibilities:
+
+      1. SIMILAR PRIOR WINS — "similar_proposals": prior engagements
+         with the same practice area, similar client size, similar
+         scope. Every entry MUST cite an engagement_id — silently
+         drop any candidate without one. [] if nothing similar;
+         never force-fit. "reuse_score": 0..1 (how much we can
+         reuse) — clamp into [0, 1].
+
+      2. CORPUS MATCHES — "matches": the top 3 archive documents
+         ranked by relevance to this RFP's scope, each as
+         {proposal_id, client, practice_areas, scope_summary,
+         outcome, similarity} with similarity 0..1. At equal
+         relevance, prefer WON deals — past wins are better template
+         fodder. "best_match_proposal_id" /
+         "best_match_similarity": echo the first match's proposal_id
+         and similarity verbatim ("" and 0 when there are no
+         matches). "total_corpus_size": the number of archive
+         documents retrieval actually returned (0 when none).
+         "high_confidence_match": true ONLY when
+         best_match_similarity >= 0.4. "reason": "" normally;
+         exactly "no_query" when the input gave you nothing to
+         search on.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+      {"similar_proposals": [], "reuse_score": 0, "matches": [], "best_match_proposal_id": "", "best_match_similarity": 0, "total_corpus_size": 0, "high_confidence_match": false, "reason": ""}
+    enforce_yields: true
+    enforce_yields_retry: 2
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "proposals_library"
+    yields:
+      similar_proposals: "list"
+      reuse_score: "number"            # 0..1; how much we can reuse
+      matches: "list"
+      best_match_proposal_id: "string"
+      best_match_similarity: "number"
+      total_corpus_size: "number"
+      high_confidence_match: "boolean"
+      reason: "string"
+    inputs:
+      upstream_yields: "object"
+      query: "string"
+      practice_areas: "list"
+    can_call:
+      - agent: "section_drafter_agent"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  section_drafter_agent:
+    name: "section_drafter_agent"
+    agent_type: "llm"
+    description: "Drafts each required section"
+    model: "claude-sonnet-4-6"
+    temperature: 0.3
+    max_completion_tokens: 6000
+    communication_type: "chain"
+    prompt: |
+      Draft proposal sections per the RFP requirements. Each section:
+        - executive_summary
+        - approach
+        - team_bios
+        - timeline
+        - case_studies (cite past_proposal IDs)
+        - pricing_summary (placeholder; pricing_configurator fills in)
+
+      Return JSON with these keys (all required):
+        - sections: list
+        - cited_past_proposals: list
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+      {"sections": [], "cited_past_proposals": []}
+    enforce_yields: true
+    enforce_yields_retry: 2
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "section_templates"
+    yields:
+      sections: "list"
+      cited_past_proposals: "list"
+    inputs:
+      upstream_yields: "object"
+    can_call:
+      - agent: "pricing_configurator_agent"
+
+  # ────────────────────────────────────────────────────────────
+  # pricing_configurator_agent — pricing within rate-card bands.
+  # Backed by agency/pricing_configurator_agent.py:
+  #   @pre_compose  pulls the practice-area rate card + the captured
+  #                 RFP's budget bounds from the dev store (real day
+  #                 rates, real bounds — not invented ones).
+  #   @chain        RECOMPUTES total_cents from the line items,
+  #                 recomputes within_band, and computes the approval
+  #                 tiers (requires_partner_signoff / _practice_lead_
+  #                 signoff) DETERMINISTICALLY — the LLM cannot fudge a
+  #                 total or waive a sign-off tier.
+  #   @compose      partner / practice-lead get a focused approval
+  #                 brief; contracts_review gets the full package.
+  # The can_call edges route on the COMPUTED flags, so the partner /
+  # practice-lead gates are a floor, not a prompt suggestion.
+  # ────────────────────────────────────────────────────────────
+  pricing_configurator_agent:
+    name: "pricing_configurator_agent"
+    agent_type: "llm"
+    description: "Builds pricing within rate-card bands; a code floor recomputes the total + approval tiers"
+    model: "gpt-4o-mini"
+    temperature: 0.0
+    max_tokens: 1500
+    communication_type: "chain"
+    prompt: |
+      You are the firm's pricing configurator. context["prepared_data"]
+      carries the practice-area rate card (role × day-rate in cents) and
+      the captured RFP's budget bounds (pre_compose pulled them). Price
+      the drafted proposal against those real day-rates.
+
+      Produce:
+        - "rfp_id": echo the upstream rfp_id VERBATIM ("" when absent)
+        - "pricing_breakdown": list of line items, each
+          {item, role_or_sku, quantity, unit_cents, subtotal_cents}
+        - "total_cents": integer — the EXACT sum of the
+          subtotal_cents values in "pricing_breakdown"
+        - "discount_pct": 0..100 — discount applied vs rack rate
+          (0 when none)
+        - "within_band": your best estimate vs the budget bounds
+
+      NOTE: a deterministic code floor RECOMPUTES total_cents from your
+      line items, recomputes within_band from the budget bounds, and
+      sets requires_partner_signoff / requires_practice_lead_signoff —
+      so price honestly; you cannot move a deal below a sign-off tier.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+      {"rfp_id": "", "pricing_breakdown": [], "total_cents": 0, "within_band": true, "discount_pct": 0, "requires_partner_signoff": false, "requires_practice_lead_signoff": false, "pricing_floor_applied": false}
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "rate_cards"
+    yields:
+      rfp_id: "string"
+      pricing_breakdown: "list"
+      total_cents: "number"
+      within_band: "boolean"
+      discount_pct: "number"
+      # ── deterministic approval tiers (set by the @chain floor) ──
+      requires_partner_signoff: "boolean"
+      requires_practice_lead_signoff: "boolean"
+      pricing_floor_applied: "boolean"
+    inputs:
+      rfp_id: "string"
+      practice_area: "string"
+      budget_range_cents: "object"
+    narration: |
+      Out-of-band pricing never advances unreviewed: a total over
+      $1M goes to the partner, a discount over 20% to the practice
+      lead, and only clean, in-band pricing flows straight to
+      contracts review. Each route below is mutually exclusive.
+    can_call:
+      # Partner signs off the largest deals (computed in the @chain floor)
+      - agent: "partner_human"
+        condition: "calling_agent_response.requires_partner_signoff == true"
+
+      # Practice lead signs off heavy discounts (computed floor; not a
+      # partner-scale deal)
+      - agent: "practice_lead_human"
+        condition: "calling_agent_response.requires_practice_lead_signoff == true"
+
+      # Clean, in-band pricing flows straight to contracts review
+      - agent: "contracts_review_agent"
+        condition: "calling_agent_response.requires_partner_signoff == false and calling_agent_response.requires_practice_lead_signoff == false"
+
+  # ────────────────────────────────────────────────────────────
+  # contracts_review_agent — ONE contracts-review role,
+  # mode-dispatched (LLM + module). Responsibilities: (1) regulatory /
+  # legal fit review of the proposal package (regulatory mode),
+  # (2) clause-by-clause playbook review of a draft contract
+  # (playbook mode). Backed by agency/contracts_review_agent.py:
+  #   @pre_compose pulls the draft contract + clauses (CLM stand-in)
+  #                and the captured RFP's compliance must-haves so the
+  #                reviewer works the REAL clauses + obligations.
+  #   @chain       the UNACCEPTABLE-CLAUSE floor — any banned /
+  #                unacceptable clause (uncapped liability, net-90,
+  #                client owns pre-existing IP, …) OR an unmet
+  #                compliance must-have FORCES requires_legal_review +
+  #                a "blocked" clearance; severity / risk_score are
+  #                recomputed from the review entries. The LLM cannot
+  #                wave a banned clause through. Fires on direct calls.
+  # The legal_human edge routes on the @chain-set requires_legal_review.
+  # ────────────────────────────────────────────────────────────
+  contracts_review_agent:
+    name: "contracts_review_agent"
+    agent_type: "llm"
+    description: "Contracts review — regulatory/legal fit check (regulatory mode) and clause-by-clause playbook review (playbook mode)"
+    model: "claude-sonnet-4-6"
+    temperature: 0.0
+    max_completion_tokens: 2500
+    communication_type: "chain"
+
+    prompt: |
+      You are the firm's contracts reviewer — one legal-adjacent role
+      with two responsibilities, dispatched by what you receive.
+      Always echo the upstream rfp_id VERBATIM into "rfp_id" (""
+      when absent). Set "mode" to exactly "regulatory" or
+      "playbook"; when unsure, choose "regulatory" — the stricter
+      HITL path.
+
+      1. REGULATORY FIT ("mode": "regulatory" — the default; a
+         proposal package coming down the drafting chain): review
+         for legal / compliance fit.
+           - "clearance": ok | needs_review | blocked (needs_review
+             when uncertain)
+           - "reasons": list (NDA terms, IP clauses, data residency,
+             regulator-specific obligations)
+           - "requires_legal_review": true on ANY blocking concern —
+             and ALWAYS true when clearance is "blocked", no
+             exceptions
+           - "partner_briefing": 3 sentences — lead with the
+             clearance verdict, cite the single highest-stakes
+             concern, recommend proceed / hold / legal-review
+         Leave every playbook key at its default (0 / [] / {} /
+         false).
+
+      2. CLAUSE PLAYBOOK REVIEW ("mode": "playbook" — the input
+         contains a draft contract / redline, or review_mode says
+         playbook): extract clauses (liability_cap, indemnification,
+         payment_terms, termination_for_convenience, ip_assignment,
+         audit_rights, warranty_period) using the contract's EXACT
+         phrases — never paraphrase; omit clause types not present.
+         Compare each clause against the firm playbook in your
+         "contract_playbook" knowledge group. Default stances when
+         the playbook is silent:
+           - liability_cap: 12-months-fees cap acceptable; 24 months
+             negotiable; unlimited / uncapped UNACCEPTABLE
+           - indemnification: mutual acceptable; broad IP indemnity
+             negotiable; unlimited / consequential-damages indemnity
+             UNACCEPTABLE
+           - payment_terms: net 30 acceptable; net 60 negotiable;
+             net 90+ / payment-upon-completion UNACCEPTABLE
+           - termination_for_convenience: 90-day notice acceptable;
+             60-day negotiable; immediate / 30-day-or-less
+             UNACCEPTABLE
+           - ip_assignment: client owns deliverables acceptable;
+             shared IP on derivative tools negotiable; client owns
+             pre-existing IP / methodology UNACCEPTABLE
+           - audit_rights: once annually with 30 days notice
+             acceptable; twice annually negotiable; anytime /
+             unrestricted UNACCEPTABLE
+           - warranty_period: 90 days acceptable; 6 months
+             negotiable; 12 months+ / indefinite UNACCEPTABLE
+         Produce:
+           - "review": one entry per extracted clause —
+             {clause_type, clause_text (≤500 chars), severity:
+             acceptable|negotiable|unacceptable|unmapped,
+             matched_pattern, playbook_stance: Accept /
+             Counter-propose / Reject / Review manually}
+           - "clauses_reviewed": the EXACT length of "review"
+           - "severity_counts": object, severity → count
+           - "unacceptable_clauses" / "negotiable_clauses" /
+             "unmapped_clauses": the clause_type lists per severity
+           - "counter_proposals": one per negotiable clause —
+             {clause_type, current, counter_propose: the playbook's
+             acceptable stance}
+           - "risk_score": min(1.0, 0.4 × unacceptable count +
+             0.15 × negotiable count + 0.05 × unmapped count),
+             rounded to 2 decimals
+           - HARD GATE: "requires_legal_review" true when ANY clause
+             is unacceptable. "requires_deal_desk_review" true when
+             there are 2 or more negotiable clauses OR 3 or more
+             unmapped clauses.
+           - "clearance" mirrors the gates: blocked when legal
+             review is required; needs_review when deal-desk review
+             is required; otherwise ok. "partner_briefing"
+             summarises clause counts + the verdict.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+      {"mode": "", "rfp_id": "", "clearance": "", "reasons": [], "requires_legal_review": false, "partner_briefing": "", "clauses_reviewed": 0, "review": [], "severity_counts": {}, "unacceptable_clauses": [], "negotiable_clauses": [], "unmapped_clauses": [], "counter_proposals": [], "risk_score": 0, "requires_deal_desk_review": false}
+
+    enforce_yields: true
+    enforce_yields_retry: 2
+
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "contract_playbook"
+
+    yields:
+      mode: "string"                   # regulatory | playbook
+      # Identity passthrough — downstream human inboxes declare rfp_id
+      rfp_id: "string"
+      # regulatory responsibility
+      clearance: "string"
+      reasons: "list"
+      requires_legal_review: "boolean"
+      partner_briefing: "string"
+      # playbook responsibility
+      clauses_reviewed: "number"
+      review: "list"
+      severity_counts: "object"
+      unacceptable_clauses: "list"
+      negotiable_clauses: "list"
+      unmapped_clauses: "list"
+      counter_proposals: "list"
+      risk_score: "number"
+      requires_deal_desk_review: "boolean"
+
+    inputs:
+      upstream_yields: "object"
+      review_mode: "string"
+      rfp_id: "string"                 # resolves the draft contract + must-haves
+
+    narration: |
+      If the package looks legally risky in a way neither the
+      playbook nor the regulatory checklist covers (novel regulator,
+      unusual jurisdiction, IP entanglement), route to legal_human
+      even when no condition fires.
+
+    can_call:
+      # HARD GATE — blocked clearance or any unacceptable clause
+      - agent: "legal_human"
+        condition: "calling_agent_response.clearance == 'blocked' or calling_agent_response.requires_legal_review == true"
+
+      - agent: "practice_lead_human"
+        condition: "calling_agent_response.clearance == 'needs_review' or calling_agent_response.requires_deal_desk_review == true and calling_agent_response.requires_legal_review == false"
+
+      - agent: "proposal_writer_human"
+        condition: "calling_agent_response.mode == 'regulatory' and calling_agent_response.clearance == 'ok'"
+
+      - agent: "bd_audit_logger_agent"
+        condition: "calling_agent_response.mode == 'playbook' and calling_agent_response.requires_legal_review == false and calling_agent_response.requires_deal_desk_review == false"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  proposal_writer_human:
+    name: "proposal_writer_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "Proposal writer — final polish + send"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 7200
+    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
+    #   gate to the SHARED inbox. Only set real operator emails: a
+    #   placeholder assigns tasks to a nonexistent operator and they
+    #   never appear in anyone's inbox.
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "escalate_to_practice_lead"
+      message: "escalate_to_practice_lead"
+      note: "Writer didn't respond — practice lead escalation"
+    yields:
+      decision: "string"
+      notes: "string"
+    inputs:
+      rfp_id: "string"
+    can_call:
+      - agent: "practice_lead_human"
+        condition: "calling_agent_response.human_message == 'escalate_to_practice_lead'"
+
+      # FINAL APPROVAL ROUTE — the writer approves/submits the proposal →
+      # the assembler RENDERS the actual document (the team finishes the
+      # job, it doesn't just route). Any non-escalation verdict that isn't
+      # an escalation lands here; the assembler's fail-closed @chain floor
+      # blocks anything that isn't a clean approval.
+      - agent: "proposal_assembler_agent"
+        condition: "calling_agent_response.human_message != 'escalate_to_practice_lead'"
+
+  # ────────────────────────────────────────────────────────────
+  # proposal_assembler_agent — the artifact-producing EXECUTOR.
+  # Runs AFTER the proposal is approved (proposal_writer_human) and
+  # RENDERS the approved package (sections + pricing + compliance
+  # attestations + terms) into a REAL document file at ./out/<rfp>.pdf
+  # (ReportLab) or ./out/<rfp>.md (deterministic fallback). Backed by
+  # agency/proposal_assembler_agent.py:
+  #   recovery — resolves the approved content across the HITL boundary
+  #              (upstream → session stash → Redis → the dev store's
+  #              approved-proposal record), exactly like the procurement
+  #              PO executor recovers its plan.
+  #   @chain   enforce_assembly_floor — FAIL-CLOSED: never assemble a
+  #              proposal that wasn't approved or that carries unresolved
+  #              compliance / pricing flags; deletes any partial artifact
+  #              and returns status "assembly_blocked".
+  # Terminus → bd_audit_logger_agent (WORM).
+  # ────────────────────────────────────────────────────────────
+  proposal_assembler_agent:
+    name: "proposal_assembler_agent"
+    agent_type: "programmatic"
+    description: "Proposal assembler — renders the APPROVED proposal package into a real document (PDF/Markdown) at ./out; fail-closed on unapproved / flagged proposals"
+    communication_type: "chain"
+    yields:
+      rfp_id: "string"
+      approved: "boolean"
+      artifact_path: "string"
+      artifact_format: "string"
+      artifact_produced: "boolean"
+      status: "string"               # assembled | not_assembled | no_content | assembly_blocked
+      summary: "string"
+      total_cents: "number"
+      total_formatted: "string"
+      section_count: "number"
+      approval_reference: "string"
+      compliance_flags: "list"
+      pricing_flags: "list"
+      blocked_reasons: "list"
+    inputs:
+      rfp_id: "string"
+      upstream_yields: "object"
+      human_message: "string"
+      approved: "boolean"
+    can_call:
+      - agent: "bd_audit_logger_agent"
+
+  practice_lead_human:
+    name: "practice_lead_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "Practice lead — pricing + practice-area sign-off"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 14400
+    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
+    #   gate to the SHARED inbox. Only set real operator emails: a
+    #   placeholder assigns tasks to a nonexistent operator and they
+    #   never appear in anyone's inbox.
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "escalate_to_partner"
+      message: "escalate_to_partner"
+      note: "Practice lead didn't respond — partner escalation"
+    yields:
+      decision: "string"
+      notes: "string"
+    inputs:
+      rfp_id: "string"
+    can_call:
+      - agent: "partner_human"
+        condition: "calling_agent_response.human_message == 'escalate_to_partner'"
+
+      - agent: "bd_audit_logger_agent"
+        condition: "calling_agent_response.human_message != 'escalate_to_partner'"
+
+  legal_human:
+    name: "legal_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "Legal counsel — compliance / IP / regulator review"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 21600
+    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
+    #   gate to the SHARED inbox. Only set real operator emails: a
+    #   placeholder assigns tasks to a nonexistent operator and they
+    #   never appear in anyone's inbox.
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "halt_for_review"
+      message: "halt_for_review"
+      note: "Legal unavailable — held"
+    yields:
+      decision: "string"
+      directive: "string"
+    inputs:
+      rfp_id: "string"
+    can_call:
+      - agent: "bd_audit_logger_agent"
+
+  partner_human:
+    name: "partner_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "Partner — high-value deals + deal-breakers"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 28800
+    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
+    #   gate to the SHARED inbox. Only set real operator emails: a
+    #   placeholder assigns tasks to a nonexistent operator and they
+    #   never appear in anyone's inbox.
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "halt_for_review"
+      message: "halt_for_review"
+      note: "Partner unavailable — held"
+    yields:
+      decision: "string"
+      directive: "string"
+    inputs:
+      rfp_id: "string"
+    can_call:
+      - agent: "bd_audit_logger_agent"
+
+  bd_audit_logger_agent:
+    name: "bd_audit_logger_agent"
+    agent_type: "external"
+    description: "Hash-chained WORM"
+    framework: "custom"
+    communication_type: "execute"
+    connector_config:
+      sink_type: "local_file"
+      local_file_path: "./logs/bd_audit.jsonl"
+    yields:
+      audit_event_id: "string"
+      written_at_utc: "string"
+      hash_chain_prev: "string"
+      hash_chain_current: "string"
+    inputs:
+      session_id: "string"
+      payload: "object"
+    can_call: []
+
+  # ────────────────────────────────────────────────────────────
+  # competitive_intel_agent — ONE competitive-intelligence role
+  # (LLM + module). Win/loss post-mortems on decision events,
+  # competitor takeaways, and quarterly reviews. Backed by
+  # agency/competitive_intel_agent.py:
+  #   @pre_compose pulls the practice-area competitor signals (CRM /
+  #                intel-store stand-in), the win/loss history and the
+  #                win rate so the analyst reasons over the firm's REAL
+  #                record on day 0 — not invented competitor behaviour.
+  # No @chain: this role produces analysis, not a control; the surfaced
+  # competitor signals are forwarded to the CRM ledger by the
+  # deterministic can_call edge below (not by the module).
+  # ────────────────────────────────────────────────────────────
+  competitive_intel_agent:
+    name: "competitive_intel_agent"
+    agent_type: "llm"
+    description: "Competitive intelligence — win/loss post-mortems; surfaced competitor signals forwarded to the CRM ledger"
+    model: "claude-sonnet-4-6"
+    temperature: 0.1
+    max_completion_tokens: 2500
+    communication_type: "chain"
+
+    prompt: |
+      You are the firm's competitive-intelligence analyst — every RFP
+      decision (won / lost / no-decision), competitor takeaway, and
+      quarterly review lands on your desk for a structured
+      post-mortem.
+
+      Produce:
+        - "decision": EXACTLY one of won | lost | no_decision |
+          withdrawn — anything you can't substantiate, use
+          no_decision
+        - "executive_summary": 3-sentence high-impact summary for
+          partners (never empty)
+        - "what_we_did_well": list of {factor, evidence}
+        - "what_we_did_poorly": list of {factor, evidence,
+          fixable_in_30d}
+        - "competitor_intelligence": list of {competitor, signal,
+          differentiator_they_used} — these entries are
+          auto-forwarded to the competitor-signal ledger in the
+          firm's CRM, so include every competitor move you can
+          substantiate; [] when none
+        - "learnings_for_library": list of {learning, where_to_store}
+          (proposal-library updates so the next RFP doesn't repeat
+          mistakes)
+        - "next_action_for_relationship": keep nurturing / close
+          out / ...
+        - "confidence": 0..1 in this analysis — clamp into [0, 1]
+
+      Honesty here drives compounding improvement. Soft-pedaling
+      losses helps no one.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+      {"decision": "", "executive_summary": "", "what_we_did_well": [], "what_we_did_poorly": [], "competitor_intelligence": [], "learnings_for_library": [], "next_action_for_relationship": "", "confidence": 0}
+
+    enforce_yields: true
+    enforce_yields_retry: 1
+
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "win_loss_archive"
+
+    yields:
+      decision: "string"
+      executive_summary: "string"
+      what_we_did_well: "list"
+      what_we_did_poorly: "list"
+      competitor_intelligence: "list"
+      learnings_for_library: "list"
+      next_action_for_relationship: "string"
+      confidence: "number"
+
+    inputs:
+      decision_event: "object"
+
+    can_call:
+      - agent: "practice_lead_human"
+        condition: "calling_agent_response.executive_summary != ''"
+
+      # Auto-archive surfaced competitor signals into the CRM ledger
+      - agent: "competitor_signal_ledger_agent"
+        condition: "calling_agent_response.competitor_intelligence != []"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ────────────────────────────────────────────────────────────
+  # competitor_signal_ledger_agent — the competitor-signal ledger,
+  # connector-only (NO Python, NO template SQLite). Signals live
+  # where a real BD team keeps them: the CRM / intel store
+  # (Salesforce, HubSpot, Klue, Crayon, Notion). One n8n workflow:
+  # ingest mode → create a signal record; query mode → return
+  # signals + top competitors for a horizon.
+  # ────────────────────────────────────────────────────────────
+  competitor_signal_ledger_agent:
+    name: "competitor_signal_ledger_agent"
+    agent_type: "programmatic"
+    description: "Competitor-signal ledger — ingest/query competitor signals in the firm's CRM / intel store via n8n"
+    communication_type: "chain"
+    integration: "n8n"
+    connector_config:
+      # n8n workflow against YOUR CRM / intel store (Salesforce,
+      # HubSpot, Klue, Crayon, Notion). Ingest mode creates a signal
+      # record; query mode returns signals for competitor + horizon.
+      webhook_url: "${CRM_SIGNAL_WEBHOOK_URL:}"
+      auth_token: "${CRM_SIGNAL_AUTH_TOKEN:}"
+    yields:
+      # Returned by your CRM workflow (lenient-filled when absent)
+      status: "string"                 # ok | error
+      competitor_queried: "string"
+      horizon_days: "number"
+      signals: "list"
+      top_competitors: "list"
+      avg_impact_score: "number"
+      high_impact_count: "number"
+      intel_briefing: "string"
+    inputs:
+      mode: "string"                   # ingest | query
+      competitor_name: "string"
+      signal_kind: "string"
+      summary: "string"
+      source: "string"
+      tags: "list"
+      impact_score: "number"
+      horizon_days: "number"
+    can_call:
+      - agent: "bd_audit_logger_agent"
+        condition: "calling_agent_response.status == 'ok'"
+    narration: |
+      If the CRM returns high-impact competitor moves
+      (high_impact_count > 0), consider routing the intel_briefing
+      to practice_lead_human.
+
+  # ────────────────────────────────────────────────────────────
+  # bid_no_bid_decisioner_agent — pre-bid go/no-go scorer. Backed by
+  # agency/bid_no_bid_decisioner_agent.py:
+  #   @pre_compose pulls the practice-area win/loss history + the
+  #                captured RFP from the dev store (CRM stand-in) so the
+  #                model scores against the firm's real track record.
+  #   @chain       RECOMPUTES overall_score from the 5 axes (exact
+  #                weights), recomputes the recommendation from the firm
+  #                thresholds, and FORCES requires_partner_review on a
+  #                no_bid / low confidence / weak score — we never
+  #                silently no-bid an opportunity.
+  # ────────────────────────────────────────────────────────────
+  bid_no_bid_decisioner_agent:
+    name: "bid_no_bid_decisioner_agent"
+    agent_type: "llm"
+    description: "Scores RFP fit on 5 axes → bid / qualify further / no-bid; partner review on low confidence"
+    model: "gpt-4o-mini"
+    temperature: 0.1
+    max_tokens: 1500
+    communication_type: "chain"
+
+    prompt: |
+      Score the fit on this RFP. Echo the upstream rfp_id VERBATIM
+      into "rfp_id" ("" when absent). context["prepared_data"] carries
+      the practice-area win/loss history + the captured RFP — score
+      against the firm's real track record. A code floor RECOMPUTES the
+      weighted overall_score and the recommendation and FORCES partner
+      review on a weak signal, so score the five axes honestly.
+
+      Axes (each 0..1):
+        - "fit_strategic"
+        - "fit_capability"
+        - "fit_economics" (cost-to-bid vs deal size)
+        - "fit_relationship" (incumbent or relationship strength)
+        - "fit_competitive" (likelihood to win vs likely incumbents)
+        - "confidence": 0..1 — how confident you are in these scores
+
+      Then apply these rules EXACTLY:
+        - "overall_score" = 0.25 × fit_strategic + 0.25 ×
+          fit_capability + 0.20 × fit_economics + 0.20 ×
+          fit_relationship + 0.10 × fit_competitive, rounded to 2
+          decimals
+        - "recommendation": "bid" when overall_score >= 0.65 AND
+          confidence >= 0.6; otherwise "qualify_further" when
+          overall_score >= 0.40; otherwise "no_bid"
+        - "requires_partner_review": true when recommendation is
+          "no_bid" OR confidence < 0.5 OR overall_score < 0.4 — we
+          NEVER silently no-bid an opportunity on a weak signal
+
+      Also produce:
+        - "risk_flags": list of objects (kind, note)
+        - "win_themes": list of strings (the 3-5 narratives we'd
+          lead with)
+        - "decision_briefing": 2-3 sentence narrative for the
+          partner — never empty; include the recommendation,
+          overall score, and confidence
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+      {"rfp_id": "", "fit_strategic": 0, "fit_capability": 0, "fit_economics": 0, "fit_relationship": 0, "fit_competitive": 0, "overall_score": 0, "confidence": 0, "recommendation": "", "risk_flags": [], "win_themes": [], "requires_partner_review": false, "decision_briefing": ""}
+
+    enforce_yields: true
+    enforce_yields_retry: 2
+
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "rfp_decision_playbook"
+
+    yields:
+      rfp_id: "string"
+      fit_strategic: "number"
+      fit_capability: "number"
+      fit_economics: "number"
+      fit_relationship: "number"
+      fit_competitive: "number"
+      overall_score: "number"
+      confidence: "number"
+      recommendation: "string"
+      risk_flags: "list"
+      win_themes: "list"
+      requires_partner_review: "boolean"
+      decision_briefing: "string"
+
+    inputs:
+      upstream_yields: "object"
+      rfp_id: "string"
+
+    can_call:
+      - agent: "partner_human"
+        condition: "calling_agent_response.requires_partner_review == true"
+      - agent: "section_drafter_agent"
+        condition: "calling_agent_response.recommendation == 'bid' and calling_agent_response.requires_partner_review == false"
+
+    auto_store_response: true
+    auto_store_yields: true

@@ -1,0 +1,17 @@
+{
+  "_entry_point": "quarterly_win_rate_review",
+  "_description": "Cadence \u2014 aggregate win/loss across the quarter for sales-leadership review.",
+  "payload": {
+    "review_period": "2026-Q2",
+    "rfp_count": 28,
+    "wins": 9,
+    "losses": 14,
+    "no_decision": 5,
+    "average_deal_size_cents": 38400000,
+    "top_competitors": [
+      "GlobalAdvise Partners",
+      "RivalConsult Group",
+      "Strategy 5"
+    ]
+  }
+}

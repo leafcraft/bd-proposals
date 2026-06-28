@@ -1,0 +1,23 @@
+{
+  "_entry_point": "decision_received",
+  "_description": "Won the deal \u2014 competitive_intel produces a structured retro: what worked, what almost lost it, who internally championed.",
+  "payload": {
+    "rfp_id": "RFP-2026-07712",
+    "client_org": "Atlantic Power Cooperative",
+    "outcome": "won",
+    "deal_value_cents": 47000000,
+    "competition": [
+      "RivalConsult Group",
+      "GlobalAdvise Partners"
+    ],
+    "win_score": 0.83,
+    "decision_signals": [
+      "incumbent strength",
+      "named partner relationship",
+      "lower price by ~6%"
+    ],
+    "internal_champions": [
+      "partner.singh@example"
+    ]
+  }
+}
