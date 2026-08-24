@@ -1,23 +1,36 @@
 # bd-proposals — BD Proposals
 
-A complete RFP-response department: one agency that takes a request for
-proposal from arrival to a signed-off, compliance-checked, priced draft —
-and learns from every win and loss. The narrative roles run from YAML; the
-four judgment-heavy roles (intake, precedent, pricing, bid/no-bid) carry a
-Python floor — a deterministic `@chain` the LLM can't waive plus a
-`@pre_compose` that pulls real context — so pricing approval tiers,
-bid/no-bid criteria, compliance must-haves, and precedent citation are
-enforced by construction, not hoped for in a prompt. A seeded dev store
-lets the whole chain run on day 0 with no connectors wired.
+A complete RFP-response **pod** (SDK 2.4.131): a **coordinator** who owns
+each pursuit, **specialists** who research/draft/price/review, a
+**finisher** that renders the real proposal document, **human members** on
+every irreversible gate, and the **LeafMesh Manager** supervising. It takes
+a request for proposal from arrival to a signed-off, compliance-checked,
+priced, *rendered* deliverable — and learns from every win and loss.
+
+The judgment-heavy roles carry a Python floor — a deterministic `@chain`
+the LLM can't waive plus a `@pre_compose` that pulls real context — so
+pricing approval tiers, bid/no-bid criteria, compliance must-haves, and
+precedent citation are enforced by construction, not hoped for in a prompt.
+The pod also fits the modern SDK capabilities to the work: the section
+drafter is a **super-agent** (plan → draft → verify) with a **playbook**
+(loaded on demand) and day-0 **tools**; the opportunity feed **fans out**
+across parallel `instances` with an atomic claim; the daily sweep cron
+carries a **timezone**. A seeded dev store + self-announcing tools let the
+whole pod run on day 0 with no connectors wired.
+
+**The discipline, in one line: agents produce, humans decide, systems
+record — and silence never advances anything** (every HITL gate
+default-denies to `held_for_review`, routed to the WORM audit sink).
 
 ## Story
 
 Priya runs business development at a mid-size services firm. Her firm's
-GovWin and SAM.gov saved searches surface a new federal RFP, and the
-**opportunity feed** (an n8n workflow against those capture tools) pulls
-it in pre-deduplicated and fit-scored. Because the fit is high, the find
-goes straight to Priya as **partner** for triage; she nudges it into the
-pipeline.
+GovWin and SAM.gov saved searches surface new federal RFPs, and the
+**opportunity feed** pulls them in pre-deduplicated and fit-scored — running
+as two parallel copies that each claim a disjoint slice of the morning's
+notices. Because one find's fit is high, it goes straight to Priya as
+**partner** for triage; she nudges it into the pipeline, where the
+**pursuit coordinator** opens the case and hands it to intake.
 
 **RFP intake** normalises the notice — client, practice area, due date,
 budget — and in the same pass extracts structured requirements from the
@@ -32,7 +45,11 @@ builds line-item pricing against the firm's rate cards; the total lands
 in-band and the discount is modest, so it flows straight to **contracts
 review**. That role runs a regulatory-fit check, finds no blocking
 clause, and routes the finished package to the **proposal writer** for
-final polish and send. Every hop is appended to a hash-chained WORM audit.
+final polish and approval. On approval the **proposal assembler** (the
+finisher) re-checks the approval token, enforces the compliance/pricing
+invariants, and renders the real proposal document to `./out` — deleting
+any partial file if a check trips. Every hop is appended to a hash-chained
+WORM audit.
 
 Three weeks later the decision arrives. The **competitive-intelligence
 analyst** runs a structured win/loss post-mortem, and the competitor
@@ -78,13 +95,21 @@ escalation targets in `configs/config.yaml`.
 - `SLACK_SIGNING_SECRET` — only needed if you add a slack *inbound*
   webhook (none ship here); leave unset otherwise.
 
-**Tier 3 — Connectors (optional; wire to your systems).** Until set, the
-two `programmatic` n8n agents return empty results gracefully and their
-crons stay off.
+**Tier 3 — Connectors (optional; wire to your systems).** The pod runs
+day-0 without these: `opportunity_feed_agent` claims from the seeded
+discovery queue (and announces `available:false` when it is drained and no
+URL is set — never a fake "0 new"); `section_drafter_agent`'s tools read
+the seeded reusable-content store; the competitor ledger is inert until
+wired.
 - `OPPORTUNITY_FEED_WEBHOOK_URL` + `OPPORTUNITY_FEED_AUTH_TOKEN` — the
   n8n workflow that queries your GovWin / SAM.gov / FedConnect saved
-  searches and returns only new notices. After wiring, uncomment the
-  `wake_up: "0 6 * * *"` cron on `opportunity_feed_agent`.
+  searches. The `wake_up: "0 6 * * *"` cron (timezone `America/New_York`)
+  is **live** — it sweeps the seed day-0 and drains your connector once
+  wired. Uncomment the `integration`/`connector_config` block on
+  `opportunity_feed_agent` to point the claim at your n8n workflow.
+- `DMS_MCP_URL` + `DMS_MCP_TOKEN` — your DMS / proposal corpus. Fill the
+  URL, then **uncomment** the `mcp` block on `section_drafter_agent` (the
+  SDK rejects an empty-URL `mcp` block at load, so it ships commented).
 - `CRM_SIGNAL_WEBHOOK_URL` + `CRM_SIGNAL_AUTH_TOKEN` — the n8n workflow
   against your CRM / intel store (Salesforce, HubSpot, Klue, Crayon,
   Notion) for the competitor-signal ledger (ingest / query).
@@ -137,22 +162,29 @@ $70M–$110M budget band (the pricing floor's in-band check).
 
 ## Agents
 
-| Agent | Role | Responsibilities | Can perform |
+| Agent | Role (human job title) | Responsibilities | Can perform |
 |---|---|---|---|
-| `opportunity_feed_agent` | Capture-tool scout | Pulls new, pre-deduplicated, fit-scored RFP notices from the firm's GovWin / SAM.gov / FedConnect saved searches | n8n connector pull; routes high-fit finds to the partner, otherwise to the audit log |
+| `bd_coordinator_agent` | Pursuit Coordinator | Owns each RFP pursuit end to end; opens the case, orchestrates the pod, keeps live status, is BD's single point of contact | LLM (pure YAML); opens the pursuit → intake, routes escalations to the partner; **never scores, drafts, prices, or reviews itself** |
+| `opportunity_feed_agent` | Capture-tool scout | Pulls new, pre-deduplicated, fit-scored RFP notices from the firm's GovWin / SAM.gov / FedConnect saved searches | Programmatic; **fans out across 2 parallel `instances`**, each claiming a disjoint batch (atomic claim); **live daily cron** (`America/New_York`); dev-store fallback that announces `available:false`; routes high-fit finds to the partner, else the audit log |
 | `rfp_intake_agent` | Opportunity-intake specialist | Normalises an inbound RFP (client, practice area, due date, budget) AND extracts structured requirements from attachments with must/should/may classification + completeness scoring | `gpt-4o-mini` over `rfp_templates` knowledge; routes deal-breakers / incomplete extraction to the partner, clean packages to precedent research |
 | `precedent_research_agent` | Precedent researcher | Retrieves similar prior wins and the top proposal-library matches as RAG context for drafting; never invents proposals retrieval didn't return | `gpt-4o-mini` over `proposals_library` (the firm's DMS); hands the corpus to the section drafter |
-| `section_drafter_agent` | Proposal drafter | Writes each required section (exec summary, approach, team bios, timeline, case studies) citing past proposals | `claude-sonnet-4-6` over `section_templates` knowledge; hands the draft to pricing |
+| `section_drafter_agent` | Proposal drafter | Plans and writes each required section (exec summary, approach, team bios, timeline, case studies) citing past proposals | `claude-sonnet-4-6` **super-agent** (plan → draft → verify, bounded by cost/wall-clock) + **`draft_sections` playbook** (on-demand craft) + day-0 **tools** (reusable prose / boilerplate) + commented DMS `mcp`; hands the draft to pricing |
 | `pricing_configurator_agent` | Pricing configurator | Builds line-item pricing against the rate card; a `@chain` floor recomputes the total from the line items and computes the approval tiers (the LLM can't dodge a sign-off) | `gpt-4o-mini` over `rate_cards` + `@pre_compose`/`@chain` floor; routes on the computed flags: >$1M → partner, >20% discount → practice lead, else → contracts review |
 | `contracts_review_agent` | Contracts reviewer | Regulatory/legal fit review of the package (regulatory mode) AND clause-by-clause playbook review of a draft contract (playbook mode) | `claude-sonnet-4-6` over `contract_playbook`; hard legal gate on any unacceptable clause / blocked clearance, deal-desk gate to practice lead, clean packages to the proposal writer |
-| `bid_no_bid_decisioner_agent` | Bid/no-bid strategist | Scores RFP fit on five axes → bid / qualify further / no-bid; never silently no-bids on a weak signal | `gpt-4o-mini` over `rfp_decision_playbook`; routes low-confidence to the partner, a "bid" verdict to the section drafter |
+| `bid_no_bid_decisioner_agent` | Bid/no-bid strategist | Scores RFP fit on five axes → bid / qualify further / no-bid; never silently no-bids on a weak signal | `gpt-4o-mini` over `rfp_decision_playbook` + a **`win_themes` playbook** (on-demand craft) + `@chain` decision floor; routes low-confidence to the partner, a "bid" verdict to the section drafter |
 | `competitive_intel_agent` | Competitive-intelligence analyst | Runs win/loss post-mortems and quarterly reviews; surfaces competitor signals and learnings | `claude-sonnet-4-6` over `win_loss_archive`; briefs the practice lead, auto-forwards surfaced signals to the CRM ledger |
 | `competitor_signal_ledger_agent` | Competitor-signal registrar | Ingests one competitor signal into / queries signals from the firm's CRM intel store (ingest / query modes) | n8n connector against the CRM; writes the result to the audit log on success |
-| `proposal_writer_human` | Proposal writer | Final polish and send of the approved proposal | Human gate (2h timeout, default-deny → escalate to practice lead); routes onward to practice lead or audit |
-| `practice_lead_human` | Practice lead | Pricing and practice-area sign-off | Human gate (4h timeout, default-deny → escalate to partner); routes to partner or audit |
-| `legal_human` | Legal counsel | Compliance / IP / regulator review on any hard-gated package | Human gate (6h timeout, default-deny → hold for review); lands in the audit log |
-| `partner_human` | Partner | Sign-off on high-value deals and deal-breakers | Human gate (8h timeout, default-deny → hold for review); lands in the audit log |
+| `proposal_writer_human` | Proposal writer | Final polish and approve/send of the proposal | Human gate (2h timeout, **default-deny → `held_for_review` → audit**); an approval routes to the assembler (finisher) |
+| `practice_lead_human` | Practice lead | Pricing and practice-area sign-off | Human gate (4h timeout, **default-deny → `held_for_review` → audit**); can send a quote back to pricing (`reprice`, a **bounded** back-edge); else records to audit |
+| `legal_human` | Legal counsel | Compliance / IP / regulator review on any hard-gated package | Human gate (6h timeout, **default-deny → `held_for_review` → audit**) |
+| `partner_human` | Partner | Sign-off on high-value deals and deal-breakers | Human gate (8h timeout, **default-deny → `held_for_review` → audit**); also the Manager's escalation target for stalled gates |
+| `proposal_assembler_agent` | Proposal assembler (the finisher) | Renders the APPROVED package into a real document at `./out` | Programmatic **finisher**: approve-token re-check (allow/deny lists, fail closed) → compliance/pricing invariants → render PDF/Markdown → **delete-on-block** → dev-store recovery across the HITL boundary; terminus → audit |
 | `bd_audit_logger_agent` | Audit registrar | Appends every terminal hop to a hash-chained, append-only (WORM) audit trail | Custom external sink → `./logs/bd_audit.jsonl` (swap for S3 Object Lock / Splunk / Datadog in prod); terminal |
+
+The **LeafMesh Manager** supervises — it reads every hand-off and escalates
+stalls / contract violations / repeated errors to the partner automatically
+(`manager.escalation`), so a stalled human gate is escalated by the
+supervisor, not by a hardcoded human→human wire.
 
 See **PRD.md** for the flow diagram, per-agent specs, data artifacts, and
 design decisions.

@@ -26,22 +26,29 @@ smarter. Every hop is appended to a tamper-evident audit trail.
 
 ```
                  ┌─────────────────────────────────────────────────────┐
-  capture tool   │  opportunity_feed (n8n)                              │
-  (GovWin/SAM) ─▶│    high-fit ─▶ partner_human                         │
+  capture tool   │  opportunity_feed  (instances: 2, each claims a      │
+  (GovWin/SAM) ─▶│    disjoint batch; live daily cron, America/NY)      │
+                 │    high-fit ─▶ partner_human                         │
                  │    else      ─▶ bd_audit_logger                      │
                  └─────────────────────────────────────────────────────┘
 
-  email / portal / referral / manual
+  email / portal / referral / manual / pursuit_status
+        │
+        ▼
+  bd_coordinator ──(open_pursuit)──▶ rfp_intake
+        ├─(escalate)──▶ partner_human
+        └─(status)────▶ bd_audit_logger
         │
         ▼
   rfp_intake ──(deal-breaker OR extraction incomplete)──▶ partner_human
         │
         └──(clean & complete)──▶ precedent_research ──▶ section_drafter ──▶ pricing
-                                                                              │
-        bid_no_bid (entry: bid_no_bid_review)                                 │
-          ├─(requires_partner_review)──▶ partner_human                       │
-          └─(bid)────────────────────▶ section_drafter                       │
-                                                                              ▼
+                                       (super-agent: plan→draft→verify;         │
+                                        playbook + tools)                       │
+        bid_no_bid (entry: bid_no_bid_review)                                   │
+          ├─(requires_partner_review)──▶ partner_human                         │
+          └─(bid)────────────────────▶ section_drafter                         │
+                                                                                ▼
                                             pricing_configurator
                                               ├─(total >$1M)──────────▶ partner_human
                                               ├─(discount >20%)───────▶ practice_lead_human
@@ -54,7 +61,15 @@ smarter. Every hop is appended to a tamper-evident audit trail.
         (regulatory ok) ──────────────────▶ proposal_writer_human              │
         (playbook clean) ─────────────────▶ bd_audit_logger                    │
 
-  proposal_writer ─(escalate)─▶ practice_lead ─(escalate)─▶ partner ─▶ audit
+  practice_lead ─(reprice, BOUNDED)─▶ pricing_configurator   # laps counted →
+                                       # exhaustion forces a terminal partner sign-off
+  proposal_writer ─(approved, not held)─▶ proposal_assembler (FINISHER)
+        proposal_assembler ─▶ renders ./out/<rfp>.{pdf,md} ─▶ bd_audit_logger
+                            └─(unapproved / flagged)─▶ delete partial, status=assembly_blocked
+
+  every human gate, on silence, DEFAULT-DENIES → human_message=held_for_review
+        └──────────────────────────────────────────────▶ bd_audit_logger
+  the Manager SUPERVISOR escalates stalled gates ──▶ partner_human
   practice_lead / legal / partner ──▶ bd_audit_logger (WORM terminus)
 
   decision_received / competitor_takeaway / quarterly_win_rate_review
@@ -72,7 +87,8 @@ smarter. Every hop is appended to a tamper-evident audit trail.
 
 | Agent | Role (job title) | Type |
 |---|---|---|
-| `opportunity_feed_agent` | Capture-tool scout | programmatic / n8n |
+| `bd_coordinator_agent` | Pursuit Coordinator | llm (gpt-4o-mini, pure YAML) |
+| `opportunity_feed_agent` | Capture-tool scout | programmatic (fan-out `instances: 2`) |
 | `rfp_intake_agent` | Opportunity-intake specialist | llm (gpt-4o-mini) |
 | `precedent_research_agent` | Precedent researcher | llm (gpt-4o-mini) |
 | `section_drafter_agent` | Proposal drafter | llm (claude-sonnet-4-6) |
@@ -85,6 +101,7 @@ smarter. Every hop is appended to a tamper-evident audit trail.
 | `practice_lead_human` | Practice lead | human |
 | `legal_human` | Legal counsel | human |
 | `partner_human` | Partner | human |
+| `proposal_assembler_agent` | Proposal assembler (finisher) | programmatic |
 | `bd_audit_logger_agent` | Audit registrar | external / custom |
 
 ## Data artifacts
@@ -111,10 +128,21 @@ smarter. Every hop is appended to a tamper-evident audit trail.
 
 ## Per-agent spec (grounded in config)
 
-- **opportunity_feed_agent** — n8n connector; `OPPORTUNITY_FEED_*` env.
-  Yields discovered/high-fit counts + lists; routes on
-  `requires_partner_review`. `wake_up` cron ships commented out until the
-  connector is wired (a cron against an empty URL just errors).
+- **bd_coordinator_agent** — Pursuit Coordinator (pure YAML). The pod's
+  single point of contact: the four inbound-RFP entry points + a
+  `pursuit_status` entry land here. Opens the pursuit (`open_pursuit` →
+  `rfp_intake`), answers status asks, and routes explicit escalations to
+  the partner. Never scores/drafts/prices/reviews itself.
+- **opportunity_feed_agent** — backed by
+  `agency/opportunity_feed_agent.py`. **Fan-out**: `instances: 2` +
+  `instances_handoff: last` — one sweep runs as 2 parallel copies, each
+  claiming a DISJOINT batch via `store.claim_opportunities` (an atomic
+  claim; swap for Redis `LPOP count` in prod). A **live** daily cron
+  (`wake_up: "0 6 * * *"`, `timezone: "America/New_York"`) sweeps day-0
+  against the seeded discovery queue and drains a real connector once
+  `OPPORTUNITY_FEED_WEBHOOK_URL` is set; it announces `available:false`
+  when the queue is empty and no URL is wired — never a synthetic "0 new".
+  Routes on `requires_partner_review`.
 - **rfp_intake_agent** — `rfp_templates` knowledge; enforce_yields(3).
   One role, two responsibilities (normalise + extract). Routes
   deal-breakers / incomplete extraction to the partner; clean packages to
@@ -122,8 +150,14 @@ smarter. Every hop is appended to a tamper-evident audit trail.
 - **precedent_research_agent** — `proposals_library` knowledge (the DMS);
   citation-required (drops candidates without engagement_id). Hands to
   the section drafter.
-- **section_drafter_agent** — `section_templates` knowledge; sonnet. Hands
-  to pricing.
+- **section_drafter_agent** — `section_templates` knowledge; sonnet
+  **super-agent** (`super_agent: {cost_ceiling: 120000, wall_clock: 900}` —
+  plan → draft → verify, bounded by its own cost/wall-clock). Carries a
+  **`draft_sections` playbook** (only `description` in the prompt;
+  `responsibility` loaded on demand) and day-0 **tools**
+  (`read_reusable_sections`, `read_boilerplate` from `agency/tools.py`,
+  self-announcing) with a commented DMS `mcp` block for prod.
+  `max_tool_calls_per_message: 15`. Hands to pricing.
 - **pricing_configurator_agent** — `rate_cards` knowledge + the
   `agency/pricing_configurator_agent.py` floor. `@pre_compose` pulls the
   rate card + budget bounds; `@chain` recomputes the total from line
@@ -136,24 +170,43 @@ smarter. Every hop is appended to a tamper-evident audit trail.
   unacceptable clause or blocked clearance; deal-desk gate to practice
   lead; clean regulatory packages to the proposal writer; clean playbook
   reviews to audit.
-- **bid_no_bid_decisioner_agent** — `rfp_decision_playbook` knowledge.
-  Five-axis weighted score; never silently no-bids. Routes low-confidence
-  to the partner, a "bid" verdict to the section drafter.
+- **bid_no_bid_decisioner_agent** — `rfp_decision_playbook` knowledge + a
+  **`win_themes` playbook** (on-demand craft for building the 3-5 win
+  narratives from the firm's track record). Five-axis weighted score;
+  never silently no-bids. Routes low-confidence to the partner, a "bid"
+  verdict to the section drafter.
 - **competitive_intel_agent** — `win_loss_archive` knowledge; sonnet.
   Briefs the practice lead; auto-forwards surfaced competitor signals to
   the ledger.
 - **competitor_signal_ledger_agent** — n8n connector; `CRM_SIGNAL_*` env.
   Ingest / query modes against the CRM; writes to audit on success.
-- **Human gates** — default-deny, fail-up chain: writer (2h) → practice
-  lead (4h) → partner (8h); legal (6h) holds for review. No
-  `operator_ids` set → tasks route to the shared inbox.
+- **Human gates** — every gate DEFAULT-DENIES on silence: the timeout
+  `fallback_response` resolves to `human_message: held_for_review`, which
+  routes to the WORM audit sink (never advances anything). Timeouts: writer
+  2h, practice lead 4h, legal 6h, partner 8h. Escalation of a stalled gate
+  is the Manager SUPERVISOR's job (`manager.escalation → partner_human`) —
+  there are no human→human `can_call` wires (a `dual→dual` footgun the SDK
+  warns on). The practice lead can send a quote back to pricing (`reprice`)
+  — a **bounded** back-edge (see below). No `operator_ids` set → tasks
+  route to the shared inbox.
+- **proposal_assembler_agent** — the artifact-producing **finisher**
+  (`agency/proposal_assembler_agent.py`), wired AFTER the writer's
+  approval. Re-checks the approval token (an allow-token allowlist + a
+  block-token denylist; an unknown verdict FAILS CLOSED), enforces the
+  compliance/pricing invariants a human can't waive, and renders the real
+  document to `./out/<rfp>.pdf` (ReportLab) or `.md` (deterministic
+  fallback). On a tripped floor it DELETES the partial artifact and returns
+  `status: assembly_blocked`. Recovers the approved package across the HITL
+  boundary (upstream → session stash → Redis → dev store). Terminus →
+  audit.
 - **bd_audit_logger_agent** — custom external; hash-chained WORM sink
   registered via `mesh.intelligence()` in main.py; terminal.
 
 ## Entry points
 
-`rfp_email`, `rfp_portal_upload`, `partner_referral`, `manual_action` →
-intake. `competitor_signal_ingest` / `competitor_intel_query` → ledger.
+`rfp_email`, `rfp_portal_upload`, `partner_referral`, `manual_action`,
+`pursuit_status` → the coordinator (`bd_coordinator_agent`).
+`competitor_signal_ingest` / `competitor_intel_query` → ledger.
 `bid_no_bid_review` → decisioner. `decision_received` /
 `competitor_takeaway` / `quarterly_win_rate_review` → competitive intel.
 `rfp_scout_daily` / `rfp_scout_manual` → opportunity feed. Plus
@@ -162,8 +215,19 @@ direct-call entries for ad-hoc invocation of the drafting-chain agents and
 
 ## Controls & trust
 
-- **Human gates default-deny on timeout**, escalating up the chain (writer
-  → practice lead → partner; legal → hold).
+- **Human gates default-deny on silence**: the timeout `fallback_response`
+  resolves to `held_for_review`, routed to the WORM audit sink — silence
+  never advances a pursuit. The Manager SUPERVISOR escalates a stalled gate
+  to the partner; no human→human wires (no `dual→dual` ping-pong).
+- **The finisher fails closed**: the proposal assembler re-checks the
+  approval token (allow/deny lists, unknown ⇒ blocked), enforces
+  compliance/pricing invariants, and DELETES a partial artifact on a
+  tripped floor — a binding document is never left on disk for an
+  unapproved/flagged proposal.
+- **Bounded back-edge (Rule 3)**: the `practice_lead → pricing` reprice
+  loop counts its laps in the session; on exhaustion the pricing floor
+  forces a terminal partner sign-off — never an unbounded price↔review
+  ping-pong.
 - **Hard legal gate by construction**: an unacceptable clause or blocked
   clearance forces `legal_human` via a `can_call` edge — not a prompt
   suggestion.
@@ -171,6 +235,9 @@ direct-call entries for ad-hoc invocation of the drafting-chain agents and
   discount route to human sign-off via mutually-exclusive edges.
 - **No silent no-bid**: the decisioner forces partner review on weak/low
   signals.
+- **Stubs announce themselves**: `opportunity_feed` + the drafter's tools
+  return `available:false` when there is no real source — never a synthetic
+  success.
 - **WORM audit on every terminus**: hash-chained so any insertion or
   deletion is detectable post-hoc.
 - **Manager escalation** (learning router, fallback all) to human +
@@ -180,9 +247,23 @@ direct-call entries for ad-hoc invocation of the drafting-chain agents and
 
 See **README.md → Configuration** for the three-tier env breakdown
 (boot / host-adapters / connectors). Most wiring lives in
-`configs/config.yaml`; the Python is the four floor modules under
-`agency/` (auto-discovered) plus `agency/_shared/` (audit sink, dev
-store, session stash).
+`configs/config.yaml`; the Python is the deterministic-floor modules +
+`proposal_assembler_agent.py` (finisher) + `opportunity_feed_agent.py`
+(fan-out claim) + `tools.py` (the drafter's day-0 tool surface), all
+auto-discovered, plus `agency/_shared/` (audit sink, dev store, session
+stash). `main.py` imports `agency.tools` before `from_yaml` so the
+`@global_tool`s register.
+
+## Modern SDK capabilities (2.4.131), fitted to the domain
+
+| Capability | Where | Why here |
+|---|---|---|
+| **super_agent** (dict form) | `section_drafter_agent` | Drafting a full proposal is autonomous plan → draft → verify across many sections; bounded by `cost_ceiling` + `wall_clock` (its own bounded loop) |
+| **playbook** (on-demand) | `section_drafter` (`draft_sections`), `bid_no_bid` (`win_themes`) | The craft lives behind a `load_skill_reference` call — only the `description` rides in the prompt, so the prompt stays identity+contract and the how-to doesn't compete with it |
+| **instances + atomic claim** | `opportunity_feed_agent` | A morning's discovery queue is a backlog; 2 parallel copies each claim a disjoint slice (`store.claim_opportunities`) so nothing is double-processed |
+| **timezone** | `opportunity_feed_agent` | The live daily sweep cron fires at 06:00 `America/New_York`, not UTC (a bare cron would fire at 01:00 local) |
+| **tools + commented mcp** | `section_drafter_agent` | Day-0 dev-store tools (`agency/tools.py`, self-announcing) pull reusable prose/boilerplate; the DMS `mcp` block ships commented (the SDK rejects an empty-URL `mcp` at load) |
+| **finisher** | `proposal_assembler_agent` | Approve-token re-check (fail closed) → invariants → render `./out` → delete-on-block → dev-store recovery |
 
 ## Deterministic floors (the depth)
 
@@ -198,9 +279,18 @@ asks for good judgment; the chain guarantees the floor.
 | `rfp_intake_agent` | captured opportunity record — its compliance must-haves + budget (store) | **recomputes `completeness_score`** from the exact rubric, derives `extraction_complete`, **unions the captured compliance must-haves** into `compliance_required` (a compliance obligation is never silently dropped) | — |
 | `precedent_research_agent` | practice-area precedents from the proposal corpus (store) | **drops any candidate without an `engagement_id`** (citation floor — no hallucinated proposals reach the drafter), recomputes `best_match_*` / corpus size / `high_confidence_match` from the surviving matches | — |
 
-Plus the WORM audit sink (`agency/_shared/audit_logger.py`), the dev
-store (`agency/_shared/store.py`, seeded so the chain runs day 0), and a
-bounded-loop scratch (`agency/_shared/session_stash.py`).
+The `pricing_configurator_agent` floor also enforces the **bounded
+back-edge**: it counts `practice_lead → pricing` reprice laps in
+`session_stash` and, once `_MAX_REPRICE_LAPS` is hit, forces a terminal
+partner sign-off.
+
+Plus the artifact-producing **finisher** (`proposal_assembler_agent.py`),
+the **fan-out** claim (`opportunity_feed_agent.py`), the drafter's day-0
+**tools** (`tools.py`), the WORM audit sink
+(`agency/_shared/audit_logger.py`), the dev store
+(`agency/_shared/store.py`, seeded — precedents, rate cards, win/loss,
+reusable content, and a discovery queue — so the whole pod runs day 0), and
+the bounded-loop scratch (`agency/_shared/session_stash.py`).
 
 ## Reflection & decisions
 
@@ -219,9 +309,21 @@ bounded-loop scratch (`agency/_shared/session_stash.py`).
   `agency/_shared/store.py` is a **dev stub** — seeded so the demo runs
   with no connectors, with every function documented as the contract a
   connector/RAG call replaces in production. No template SQLite ledger.
-- **Connectors degrade gracefully.** The two n8n agents lenient-fill empty
-  results and their crons stay commented until the customer wires a real
-  URL, so the mesh boots and runs before any external system exists.
+- **Connectors degrade gracefully — and announce it.** The opportunity
+  feed runs its live cron day-0 against the seeded discovery queue and
+  returns `available:false` (never a fake "0 new") once it is drained with
+  no URL wired; the competitor ledger stays inert until its URL is set. A
+  stub never fakes a synthetic success.
+- **A pod, not a pipeline.** The pursuit coordinator owns each case; the
+  specialists research/draft/price/review; the finisher renders the real
+  document; the human members decide on every irreversible gate; the
+  Manager supervises. One human, one agent, one system per stage — agents
+  produce, humans decide, systems record.
+- **Modern capabilities fitted to the work, not bolted on.** The drafter is
+  a super-agent because drafting is genuinely plan→execute→verify; the feed
+  fans out because a discovery queue is a backlog; the playbooks hold craft
+  the prompt shouldn't carry; the cron carries a timezone because a BD team
+  works in local hours. See the *Modern SDK capabilities* table above.
 - **Pricing routing enforced by a code floor.** The approval routes are
   mutually-exclusive `can_call` edges that fire on the **deterministically
   computed** `requires_partner_signoff` / `requires_practice_lead_signoff`

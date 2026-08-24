@@ -20,6 +20,7 @@ multi-replica deployment.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -456,6 +457,125 @@ def top_competitors(practice_area: str = "") -> list[str]:
             s.get("impact_score", 0)
         )
     return [c for c, _ in sorted(agg.items(), key=lambda kv: -kv[1]) if c]
+
+
+# ── Reusable proposal content — the section drafter's raw material ────────
+# The super-agent section drafter pulls reusable prior-proposal prose +
+# firm boilerplate from the DMS to assemble sections faster (distinct from
+# the precedent researcher, which produces CITATIONS). PROD: the DMS /
+# proposal-authoring corpus (the commented `mcp` block on section_drafter).
+_REUSABLE_SECTION_SEED: dict[str, list[dict[str, Any]]] = {
+    "infrastructure_advisory": [
+        {"section": "approach",
+         "title": "Phased Corridor Modernisation Approach",
+         "body": ("A three-phase method proven on two State DOT wins: (1) "
+                  "baseline traffic + environmental assessment, (2) options "
+                  "modelling, (3) a federal-funding capture plan aligned to "
+                  "FHWA programs."),
+         "source_engagement": "ENG-2024-0431"},
+        {"section": "team_bios",
+         "title": "Partner-Led Transportation Team",
+         "body": ("Partner-led team including two former FHWA-adjacent "
+                  "principals and senior transportation consultants who "
+                  "delivered the Region II corridor roadmap."),
+         "source_engagement": "ENG-2024-0431"},
+    ],
+    "_default": [
+        {"section": "approach",
+         "title": "Structured Delivery Approach",
+         "body": ("A phase-gated delivery approach with quarterly reviews and "
+                  "clear acceptance criteria at each milestone."),
+         "source_engagement": ""},
+    ],
+}
+
+# Firm boilerplate — standard terms + compliance language the drafter reuses
+# verbatim so wording stays consistent and legally reviewed.
+_BOILERPLATE_SEED: dict[str, Any] = {
+    "terms": [
+        "Net 30 payment terms.",
+        "Liability capped at 12 months of fees.",
+        "Client owns all deliverables produced under this engagement.",
+    ],
+    "compliance_language": {
+        "NDA": "Mutual NDA executed; data-handling addendum attached.",
+        "FedRAMP": "Hosting on a FedRAMP-Moderate authorized environment.",
+        "SOC2": "SOC 2 Type II report available under NDA.",
+    },
+}
+
+# Discovery queue — the 'new since last seen' notices the capture-tool sweep
+# would return (GovWin / SAM.gov / FedConnect). The parallel opportunity_feed
+# instances CLAIM disjoint batches from this queue (dev stand-in for the
+# connector's cursor). PROD: the n8n workflow's paged results.
+_DISCOVERY_QUEUE_SEED: list[dict[str, Any]] = [
+    {"rfp_id": "RFP-2026-09001",
+     "client_org": "State DOT — Region VII", "practice_area": "infrastructure_advisory",
+     "source": "GovWin", "fit_score": 0.81,
+     "scope_summary": "Bridge network resilience + capital planning."},
+    {"rfp_id": "RFP-2026-09002",
+     "client_org": "Regional Water Authority", "practice_area": "infrastructure_advisory",
+     "source": "SAM.gov", "fit_score": 0.58,
+     "scope_summary": "Stormwater master plan modernisation."},
+    {"rfp_id": "RFP-2026-09003",
+     "client_org": "Metro Transit Authority", "practice_area": "infrastructure_advisory",
+     "source": "FedConnect", "fit_score": 0.74,
+     "scope_summary": "Transit-oriented development advisory."},
+]
+
+_HIGH_FIT_MIN = 0.70
+
+
+def read_reusable_sections(practice_area: str = "") -> dict[str, Any]:
+    """Reusable prior-proposal section prose for a practice area. Announces
+    `available: false` when there is genuinely nothing to reuse (and a real
+    DMS connector is wired but returned nothing). PROD: DMS / corpus read."""
+    corpus = _seeded("reusable_sections", _REUSABLE_SECTION_SEED)
+    pa = (practice_area or "").strip().lower()
+    sections = corpus.get(pa) or corpus.get("_default") or []
+    if not sections:
+        if os.getenv("DMS_MCP_URL"):
+            return {"available": False, "reason": "DMS connector wired but returned nothing for this practice area"}
+        return {"available": False, "reason": "no reusable sections seeded; wire DMS_MCP_URL"}
+    return {"available": True, "practice_area": practice_area, "sections": sections}
+
+
+def read_boilerplate(kind: str = "terms") -> dict[str, Any]:
+    """Firm boilerplate (standard `terms` or `compliance_language`) the drafter
+    reuses verbatim. Announces `available: false` for an unknown kind."""
+    data = _seeded("boilerplate", _BOILERPLATE_SEED)
+    value = data.get((kind or "terms").strip().lower())
+    if value in (None, [], {}):
+        return {"available": False, "reason": f"no boilerplate of kind {kind!r}"}
+    return {"available": True, "kind": kind, "content": value}
+
+
+def claim_opportunities(count: int = 5) -> dict[str, Any]:
+    """Atomically claim up to `count` NEW opportunities from the discovery
+    queue. Each parallel `opportunity_feed_agent` instance claims a DISJOINT
+    batch (so copies never double-process the same notice). Dev implementation
+    uses a process lock + queue file; swap for Redis `LPOP count` or
+    `UPDATE ... SKIP LOCKED RETURNING` in a multi-replica deployment.
+
+    Announces `available: false` when the queue is empty AND no connector is
+    wired — a stub must never fake a synthetic success.
+    """
+    connector = bool(os.getenv("OPPORTUNITY_FEED_WEBHOOK_URL"))
+    with _LOCK:
+        data = _seeded("discovery_queue", {"items": list(_DISCOVERY_QUEUE_SEED)})
+        items = data.get("items", []) if isinstance(data, dict) else []
+        if not items:
+            if connector:
+                return {"available": False, "reason": "connector wired but returned no new notices", "claimed": []}
+            return {"available": False,
+                    "reason": "discovery queue empty; wire OPPORTUNITY_FEED_WEBHOOK_URL", "claimed": []}
+        n = max(1, int(count or 1))
+        claimed = items[:n]
+        data["items"] = items[n:]
+        _save("discovery_queue", data)
+        remaining = len(data["items"])
+    return {"available": True, "claimed": claimed, "remaining": remaining,
+            "high_fit_min": _HIGH_FIT_MIN}
 
 
 new_id = _new_id

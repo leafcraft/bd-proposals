@@ -34,6 +34,7 @@ from typing import Any
 from leafmesh import LeafMeshLogger, chain, compose, pre_compose
 
 from agency._shared import store
+from agency._shared.session_stash import bump, peek
 
 logger = LeafMeshLogger(__name__)
 
@@ -41,6 +42,12 @@ logger = LeafMeshLogger(__name__)
 # waive these; they are applied in code.
 _PARTNER_SIGNOFF_TOTAL_CENTS = 100_000_000   # > $1,000,000 → partner
 _PRACTICE_LEAD_DISCOUNT_PCT = 20             # > 20% discount → practice lead
+
+# Bounded back-edge (Rule 3): the practice_lead_human gate can kick a quote
+# back to be re-priced (human_message == 'reprice'). We COUNT those laps in
+# the mesh and, once exhausted, force a partner sign-off — a terminal route,
+# never an unbounded price ↔ review ping-pong.
+_MAX_REPRICE_LAPS = 2
 
 _DEFAULTS: dict[str, Any] = {
     "rfp_id": "",
@@ -159,6 +166,18 @@ async def enforce_pricing_floor(result: dict, ctx: dict) -> dict[str, Any]:
         discount > _PRACTICE_LEAD_DISCOUNT_PCT
         and total <= _PARTNER_SIGNOFF_TOTAL_CENTS
     )
+
+    # 4. Bounded back-edge exhaustion → terminal route. If the practice lead
+    #    has kicked this quote back to be re-priced too many times, stop the
+    #    loop by forcing a partner sign-off (and never a practice-lead one).
+    reprice_laps = int(result.pop("_reprice_laps", 0) or 0)
+    if reprice_laps >= _MAX_REPRICE_LAPS:
+        result["requires_partner_signoff"] = True
+        result["requires_practice_lead_signoff"] = False
+        logger.info(
+            f"enforce_pricing_floor — reprice laps exhausted ({reprice_laps}); "
+            f"forcing partner sign-off (terminal)"
+        )
     result["pricing_floor_applied"] = True
     if not result.get("rfp_id"):
         result["rfp_id"] = pctx.get("rfp_id", "")
@@ -215,12 +234,21 @@ async def pricing_configurator_agent(llm_response, input_data: dict,
     if not isinstance(breakdown, list):
         breakdown = []
 
+    # Bounded back-edge: count practice-lead re-price laps in the session so
+    # the floor can force a terminal partner sign-off once exhausted.
+    sid = str(context.get("session_id") or input_data.get("session_id") or "")
+    signal = str(
+        input_data.get("human_message") or input_data.get("decision") or ""
+    ).strip().lower()
+    reprice_laps = bump(sid, "reprice_laps") if signal == "reprice" else peek(sid, "reprice_laps")
+
     computed = {
         "rfp_id": str(parsed.get("rfp_id", "")) or pctx.get("rfp_id", ""),
         "pricing_breakdown": breakdown,
         "total_cents": _as_int(parsed.get("total_cents", 0)),
         "within_band": bool(parsed.get("within_band", True)),
         "discount_pct": parsed.get("discount_pct", 0),
+        "_reprice_laps": reprice_laps,   # internal marker read + popped by the floor
     }
     logger.info(
         f"pricing_configurator_agent — rfp_id={computed['rfp_id']} "

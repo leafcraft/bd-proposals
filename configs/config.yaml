@@ -15,15 +15,17 @@ environment: "development"
 debug: true
 log_level: "INFO"
 
-redis:
-  host: "${REDIS_HOST:localhost}"
-  port: ${REDIS_PORT:6379}
-  db: 0
-  password: "${REDIS_PASSWORD:}"
-  auto_storage: true
-  decode_responses: true
-  default_ttl: 86400
-  session_ttl: 2592000
+persistence:
+  backend: redis
+  redis:
+    host: "${REDIS_HOST:localhost}"
+    port: ${REDIS_PORT:6379}
+    db: 0
+    password: "${REDIS_PASSWORD:}"
+    auto_storage: true
+    decode_responses: true
+    default_ttl: 86400
+    session_ttl: 2592000
 
 auto_discover:
   directory: "./agency"
@@ -31,7 +33,6 @@ auto_discover:
   recursive: false
 
 manager:
-  enabled: true
   model: "gpt-4o-mini"
   domain: "generic"
   can_intervene: true
@@ -103,6 +104,13 @@ manager:
 mesh:
   call_timeout: 120
 
+# 2.4.131 runtime block — proposal drafting runs long (the section_drafter is a
+# super-agent that plans → drafts → verifies across many sections). The 2.4.131
+# default llm_hard_timeout_s dropped 300s → 90s, so we raise it back here.
+# (This block is REJECTED by ≤2.4.130 — it must land with the 2.4.131 floor.)
+timeouts:
+  llm_hard_timeout_s: 300
+
 data_structures:
   RFP:
     type: "object"
@@ -116,22 +124,29 @@ data_structures:
       received_at_utc: { type: "string" }
     required: ["rfp_id"]
 
+# ── Entry points — one per real-world trigger. The four inbound-RFP
+#    triggers open a PURSUIT via the coordinator (bd_coordinator_agent),
+#    who owns the case and is the single point of contact.
 entry_points:
   - name: "rfp_email"
-    target: "rfp_intake_agent"
-    description: "RFP arrived via email"
+    target: "bd_coordinator_agent"
+    description: "RFP arrived via email — the coordinator opens the pursuit"
 
   - name: "rfp_portal_upload"
-    target: "rfp_intake_agent"
-    description: "RFP uploaded via vendor portal"
+    target: "bd_coordinator_agent"
+    description: "RFP uploaded via vendor portal — the coordinator opens the pursuit"
 
   - name: "partner_referral"
-    target: "rfp_intake_agent"
-    description: "Partner-sourced opportunity"
+    target: "bd_coordinator_agent"
+    description: "Partner-sourced opportunity — the coordinator opens the pursuit"
 
   - name: "manual_action"
-    target: "rfp_intake_agent"
-    description: "BD-initiated"
+    target: "bd_coordinator_agent"
+    description: "BD-initiated — the coordinator opens the pursuit"
+
+  - name: "pursuit_status"
+    target: "bd_coordinator_agent"
+    description: "'Where is this RFP?' — the coordinator answers from the case record"
 
   - name: "competitor_signal_ingest"
     target: "competitor_signal_ledger_agent"
@@ -201,6 +216,61 @@ entry_points:
 agents:
 
   # ────────────────────────────────────────────────────────────
+  # bd_coordinator_agent — Pursuit Coordinator (AI). Owns each RFP
+  # pursuit end to end: opens the case, orchestrates the pod, keeps
+  # live status, and is BD's single point of contact. Pure
+  # orchestration — it never scores fit, drafts a section, prices, or
+  # reviews a clause itself; it routes work to the specialists and
+  # exceptions to the partner. (Pure YAML — like the reference pod's
+  # coordinator.)
+  # ────────────────────────────────────────────────────────────
+  bd_coordinator_agent:
+    name: "bd_coordinator_agent"
+    agent_type: "llm"
+    communication_type: "chain"
+    model: "gpt-4o-mini"
+    temperature: 0.1
+    max_tokens: 800
+    description: "Pursuit Coordinator — opens the case, orchestrates the pod, keeps status, single point of contact"
+    prompt: |
+      You are the firm's Pursuit Coordinator. You OWN each RFP pursuit from
+      the moment it arrives to the moment a proposal ships — you orchestrate
+      the pod and keep BD informed, but you never score fit, draft, price, or
+      review a clause yourself.
+
+      On a NEW inbound RFP (email / portal / referral / manual): open the
+      pursuit, echo the rfp_id VERBATIM ("" when the input carries none),
+      record the stage as "intake", and set action to "open_pursuit" so RFP
+      intake takes it.
+
+      On a STATUS ask: set action to "status" and answer the current stage /
+      what it is waiting on from what you were given — never invent progress.
+
+      If the input signals something that must not proceed automatically (an
+      explicit escalate flag, a stated deal-breaker, a partner-only request),
+      set action to "escalate" so the partner takes it.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+      {"action": "", "rfp_id": "", "stage": "", "waiting_on": "", "summary": ""}
+    yields:
+      action: "string"        # open_pursuit | status | escalate
+      rfp_id: "string"
+      stage: "string"
+      waiting_on: "string"
+      summary: "string"
+    inputs:
+      payload: "object"
+      documents: "list"
+      trigger: "string"
+    can_call:
+      - agent: "rfp_intake_agent"
+        condition: "calling_agent_response.action == 'open_pursuit'"
+      - agent: "partner_human"
+        condition: "calling_agent_response.action == 'escalate'"
+      - agent: "bd_audit_logger_agent"
+        condition: "calling_agent_response.action == 'status'"
+
+  # ────────────────────────────────────────────────────────────
   # opportunity_feed_agent — the firm's opportunity feed,
   # connector-only (NO Python). The watchlist, saved searches and
   # dedup live where they already live for a real BD team: the
@@ -212,17 +282,36 @@ agents:
   opportunity_feed_agent:
     name: "opportunity_feed_agent"
     agent_type: "programmatic"
-    description: "Opportunity feed — pulls new, pre-deduplicated RFP notices from the firm's capture tool (GovWin / SAM.gov / FedConnect) via n8n"
+    description: "Opportunity feed — pulls new, pre-deduplicated RFP notices from the firm's capture tool (GovWin / SAM.gov / FedConnect)"
     communication_type: "chain"
-    integration: "n8n"
-    connector_config:
-      # n8n workflow that queries YOUR GovWin / SAM.gov / FedConnect
-      # saved searches and returns only new, fit-scored notices.
-      webhook_url: "${OPPORTUNITY_FEED_WEBHOOK_URL:}"
-      auth_token: "${OPPORTUNITY_FEED_AUTH_TOKEN:}"
-    # wake_up: "0 6 * * *"   # enable after wiring your GovWin/SAM.gov connector
+    # Backed by agency/opportunity_feed_agent.py: it CLAIMS a disjoint batch of
+    # new notices per sweep and announces available:false when the queue is
+    # empty and no connector is wired (never a synthetic "0 new"). To go live,
+    # set OPPORTUNITY_FEED_WEBHOOK_URL — the claim then drains the n8n
+    # workflow's paged results instead of the seeded discovery queue.
+    #   integration: "n8n"
+    #   connector_config:
+    #     webhook_url: "${OPPORTUNITY_FEED_WEBHOOK_URL:}"
+    #     auth_token: "${OPPORTUNITY_FEED_AUTH_TOKEN:}"
+    #
+    # Backlog FAN-OUT: one sweep → 2 parallel copies; each claims a DISJOINT
+    # batch via store.claim_opportunities (an atomic claim — copies never
+    # double-process). instances_handoff: last COMBINES the copies (counts SUM,
+    # lists concatenate) so the routing below fires once on the merged sweep.
+    instances: 2
+    instances_handoff: "last"
+    # Scheduled daily sweep, in the firm's timezone (NOT UTC — a bare cron
+    # fires at 06:00 UTC = 01:00 ET). ONE cron line is all a fanned agent needs
+    # (a cron LIST × instances would multiply the runs).
+    wake_up: "0 6 * * *"
+    timezone: "America/New_York"
+    wake_up_input:
+      trigger: "rfp_scout_daily"
     yields:
-      # Returned by your capture-tool workflow (lenient-filled when absent)
+      # A stub that announces itself: available:false + reason on an empty,
+      # unwired sweep — never a synthetic "0 new".
+      available: "boolean"
+      reason: "string"
       discovered_count: "number"
       discovered_rfps: "list"
       high_fit_count: "number"
@@ -445,26 +534,41 @@ agents:
     auto_store_response: true
     auto_store_yields: true
 
+  # ────────────────────────────────────────────────────────────
+  # section_drafter_agent — Proposal Drafter (AI, SUPER-AGENT).
+  # Drafting a full proposal is autonomous plan → execute → verify
+  # work across many sections, so this role is wrapped in the
+  # super-agent orchestrator (bounded by cost_ceiling + wall_clock —
+  # its OWN bounded loop). It pulls reusable prose + firm boilerplate
+  # via tools (dev-store day-0, DMS mcp in prod) and loads the
+  # `draft_sections` playbook for the craft (only its `description`
+  # rides in the prompt; the `responsibility` is fetched on demand).
+  # ────────────────────────────────────────────────────────────
   section_drafter_agent:
     name: "section_drafter_agent"
     agent_type: "llm"
-    description: "Drafts each required section"
+    description: "Proposal drafter — plans and writes each required section, citing prior wins (super-agent)"
     model: "claude-sonnet-4-6"
     temperature: 0.3
     max_completion_tokens: 6000
+    max_tool_calls_per_message: 15   # a full proposal is many sections + pulls; default 5 truncates silently
     communication_type: "chain"
+    super_agent:                     # DICT form = the tuning path (2.4.123+); the ONLY way to tune it
+      cost_ceiling: 120000           # aggregate token budget for one drafting run
+      wall_clock: 900                # per-run wall-clock seconds
     prompt: |
-      Draft proposal sections per the RFP requirements. Each section:
-        - executive_summary
-        - approach
-        - team_bios
-        - timeline
-        - case_studies (cite past_proposal IDs)
-        - pricing_summary (placeholder; pricing_configurator fills in)
+      You are the firm's proposal drafter. Turn the RFP requirements +
+      precedent research (upstream) into a complete set of proposal sections:
+      executive_summary, approach, team_bios, timeline, case_studies (cite
+      the past-proposal IDs precedent research returned), and a
+      pricing_summary PLACEHOLDER (pricing_configurator fills the numbers).
 
-      Return JSON with these keys (all required):
-        - sections: list
-        - cited_past_proposals: list
+      Plan the sections, pull your raw material with your tools, then write.
+      Use read_reusable_sections(practice_area) to adapt proven prior-proposal
+      prose, and read_boilerplate(kind) for standard terms / compliance
+      language you must reuse VERBATIM. Load the `draft_sections` playbook for
+      the assembly order and the citation rule. Never invent a case study or a
+      citation the precedent research did not return.
 
       OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
       {"sections": [], "cited_past_proposals": []}
@@ -474,6 +578,39 @@ agents:
       serviceName: "mongo_main"
       enabled: true
       groupName: "section_templates"
+    # Playbook — the CRAFT, fetched on demand. Only `description` rides in the
+    # prompt; `responsibility` is loaded when the model recognises the intent.
+    playbook:
+      - intent: draft_sections
+        description: "How to assemble a complete, citation-clean proposal draft."
+        responsibility: |
+          1. Read the RFP requirements + precedent matches FIRST — the
+             must/should/may lines decide which sections carry weight.
+          2. Pull reusable prose (read_reusable_sections) and adapt it to THIS
+             client; pull boilerplate (read_boilerplate) for terms + compliance
+             wording and reuse it verbatim.
+          3. Write in order: executive_summary, approach, team_bios, timeline,
+             case_studies. Every case study MUST cite a past-proposal ID that
+             precedent research actually returned — drop any you cannot cite.
+          4. Leave pricing_summary as a placeholder; pricing_configurator fills
+             the numbers. Return the full section list + cited_past_proposals.
+        variables: [practice_area]
+    # Day-0 tool surface — reads the seeded reusable-content store so the pod
+    # drafts with NO connector wired. Each tool announces available:false when
+    # it has no real source. See agency/tools.py.
+    tools: [read_reusable_sections, read_boilerplate]
+    tool_categories: [drafting]
+    # ── To wire your real DMS / proposal corpus, uncomment and set the URL
+    #    (each named action under `use:` becomes its own tool). NOTE: the SDK
+    #    rejects an http mcp block with an EMPTY url at load, so this ships
+    #    commented — fill the URL, then uncomment. ──
+    # mcp:
+    #   - transport: http
+    #     url: "${DMS_MCP_URL}"
+    #     token: "${DMS_MCP_TOKEN:}"
+    #     use: [search_corpus, read_document]
+    #     name: dms
+    #     timeout: 30
     yields:
       sections: "list"
       cited_past_proposals: "list"
@@ -740,27 +877,34 @@ agents:
     #   gate to the SHARED inbox. Only set real operator emails: a
     #   placeholder assigns tasks to a nonexistent operator and they
     #   never appear in anyone's inbox.
+    # DEFAULT-DENY on silence: a timeout resolves to a non-approving
+    # held_for_review, which routes to the WORM audit sink (never advances the
+    # send). The Manager SUPERVISOR (manager.escalation → partner_human) is
+    # what escalates a stalled gate — no hardcoded human→human wire (that would
+    # be a dual↔dual footgun the SDK warns on).
     fallback_on_timeout: true
     fallback_response:
-      decision: "escalate_to_practice_lead"
-      message: "escalate_to_practice_lead"
-      note: "Writer didn't respond — practice lead escalation"
+      human_decision: "held"
+      human_message: "held_for_review"
+      message: "held_for_review"
+      note: "Writer didn't respond — held for review"
     yields:
       decision: "string"
       notes: "string"
     inputs:
       rfp_id: "string"
     can_call:
-      - agent: "practice_lead_human"
-        condition: "calling_agent_response.human_message == 'escalate_to_practice_lead'"
-
       # FINAL APPROVAL ROUTE — the writer approves/submits the proposal →
       # the assembler RENDERS the actual document (the team finishes the
-      # job, it doesn't just route). Any non-escalation verdict that isn't
-      # an escalation lands here; the assembler's fail-closed @chain floor
-      # blocks anything that isn't a clean approval.
+      # job, it doesn't just route). Any verdict that isn't a held_for_review
+      # lands here; the assembler's fail-closed @chain floor blocks anything
+      # that isn't a clean approval.
       - agent: "proposal_assembler_agent"
-        condition: "calling_agent_response.human_message != 'escalate_to_practice_lead'"
+        condition: "calling_agent_response.human_message != 'held_for_review'"
+
+      # Silence / hold → recorded in the WORM audit, never advanced.
+      - agent: "bd_audit_logger_agent"
+        condition: "calling_agent_response.human_message == 'held_for_review'"
 
   # ────────────────────────────────────────────────────────────
   # proposal_assembler_agent — the artifact-producing EXECUTOR.
@@ -819,22 +963,30 @@ agents:
     #   gate to the SHARED inbox. Only set real operator emails: a
     #   placeholder assigns tasks to a nonexistent operator and they
     #   never appear in anyone's inbox.
+    # DEFAULT-DENY on silence → held_for_review → WORM audit. Escalation of a
+    # stalled gate is the Manager SUPERVISOR's job (manager.escalation →
+    # partner_human), not a hardcoded human→human wire (dual↔dual footgun).
     fallback_on_timeout: true
     fallback_response:
-      decision: "escalate_to_partner"
-      message: "escalate_to_partner"
-      note: "Practice lead didn't respond — partner escalation"
+      human_decision: "held"
+      human_message: "held_for_review"
+      message: "held_for_review"
+      note: "Practice lead didn't respond — held for review"
     yields:
       decision: "string"
       notes: "string"
     inputs:
       rfp_id: "string"
     can_call:
-      - agent: "partner_human"
-        condition: "calling_agent_response.human_message == 'escalate_to_partner'"
+      # BOUNDED BACK-EDGE (Rule 3): the practice lead can kick a quote back to
+      # be re-priced. pricing_configurator COUNTS the laps and, once exhausted,
+      # forces a terminal partner sign-off — never an unbounded ping-pong.
+      - agent: "pricing_configurator_agent"
+        condition: "calling_agent_response.human_message == 'reprice'"
 
+      # Every other verdict (incl. the held_for_review timeout) is recorded.
       - agent: "bd_audit_logger_agent"
-        condition: "calling_agent_response.human_message != 'escalate_to_partner'"
+        condition: "calling_agent_response.human_message != 'reprice'"
 
   legal_human:
     name: "legal_human"
@@ -848,11 +1000,13 @@ agents:
     #   gate to the SHARED inbox. Only set real operator emails: a
     #   placeholder assigns tasks to a nonexistent operator and they
     #   never appear in anyone's inbox.
+    # DEFAULT-DENY on silence → held_for_review → WORM audit (never proceeds).
     fallback_on_timeout: true
     fallback_response:
-      decision: "halt_for_review"
-      message: "halt_for_review"
-      note: "Legal unavailable — held"
+      human_decision: "held"
+      human_message: "held_for_review"
+      message: "held_for_review"
+      note: "Legal unavailable — held for review"
     yields:
       decision: "string"
       directive: "string"
@@ -873,11 +1027,13 @@ agents:
     #   gate to the SHARED inbox. Only set real operator emails: a
     #   placeholder assigns tasks to a nonexistent operator and they
     #   never appear in anyone's inbox.
+    # DEFAULT-DENY on silence → held_for_review → WORM audit (never proceeds).
     fallback_on_timeout: true
     fallback_response:
-      decision: "halt_for_review"
-      message: "halt_for_review"
-      note: "Partner unavailable — held"
+      human_decision: "held"
+      human_message: "held_for_review"
+      message: "held_for_review"
+      note: "Partner unavailable — held for review"
     yields:
       decision: "string"
       directive: "string"
@@ -1091,7 +1247,8 @@ agents:
       Also produce:
         - "risk_flags": list of objects (kind, note)
         - "win_themes": list of strings (the 3-5 narratives we'd
-          lead with)
+          lead with) — load the `win_themes` playbook for how to
+          build them from the firm's track record
         - "decision_briefing": 2-3 sentence narrative for the
           partner — never empty; include the recommendation,
           overall score, and confidence
@@ -1106,6 +1263,23 @@ agents:
       serviceName: "mongo_main"
       enabled: true
       groupName: "rfp_decision_playbook"
+
+    # Playbook — the CRAFT of shaping WIN THEMES, fetched on demand. Only
+    # `description` rides in the prompt; the `responsibility` (the how-to) is
+    # loaded when the model recognises the win-themes intent.
+    playbook:
+      - intent: win_themes
+        description: "How to build the 3-5 win themes we'd lead the proposal with."
+        responsibility: |
+          1. Anchor each theme to EVIDENCE from the firm's track record — a
+             prior win in this practice area, an incumbent relationship, a
+             capability the competitor lacks. A theme with no evidence is a
+             wish, not a win theme; cut it.
+          2. Counter the likely incumbent directly: name the differentiator
+             that beats them (past performance, price-to-value, a hire).
+          3. Keep 3-5 themes, each one sentence, each one the client's
+             evaluators could repeat back. Order by strategic weight.
+        variables: [rfp_id]
 
     yields:
       rfp_id: "string"
