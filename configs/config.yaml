@@ -15,18 +15,6 @@ environment: "development"
 debug: true
 log_level: "INFO"
 
-persistence:
-  backend: redis
-  redis:
-    host: "${REDIS_HOST:localhost}"
-    port: ${REDIS_PORT:6379}
-    db: 0
-    password: "${REDIS_PASSWORD:}"
-    auto_storage: true
-    decode_responses: true
-    default_ttl: 86400
-    session_ttl: 2592000
-
 auto_discover:
   directory: "./agency"
   pattern: "*_agent.py"
@@ -57,10 +45,13 @@ manager:
         competitor_signal_ledger (connector)
       - practice lead / partner / legal HITL chain
 
-    Escalate when:
-      - RFP requires regulated industry experience we lack
-      - pricing outside discount band > 20%
-      - compliance flag (NDA, IP, data residency, regulator)
+    The business gates are wires, not your job: a deal-breaker or a thin
+    extraction goes to the partner from intake; a total over $1,000,000 to
+    the partner and a discount over 20% to the practice lead from pricing; a
+    blocked clause or compliance flag to legal from contracts review.
+    Escalate to the partner only when an agent fails in a way a retry will
+    not fix, or keeps failing. An approval nobody answers is not escalated:
+    the request waits its time and stops, and nothing advances on silence.
 
   routing:
     mode: "learning"
@@ -78,37 +69,42 @@ manager:
     targets:
       - type: "human_agent"
         agent: "partner_human"
-      - type: "webhook"
-        url: "${PAGER_WEBHOOK:https://events.pagerduty.com/v2/enqueue}"
-        method: "POST"
-        headers:
-          Content-Type: "application/json"
-        payload_template:
-          incident_id: "{{rfp_id}}"
-          severity: "{{severity}}"
-          message: "{{message}}"
-          session_id: "{{session_id}}"
-      - type: "channel"
-        provider: "slack"
-        channel_id: "${SLACK_BD_CHANNEL:}"
-        message_template: "[bd] {{message}} — rfp {{rfp_id}}"
+      # Webhook escalation (e.g. PagerDuty): create the vault connection
+      # 'escalation_webhook' (an "Add custom" record on the Infrastructure
+      # page, service type 'Outbound webhook'), then uncomment — here before the
+      # first start, in Studio's YAML editor after it (applies live).
+      # - type: "webhook"
+        # connection: escalation_webhook   # vault connection holds the URL + headers
+        # method: "POST"
+        # payload_template:
+          # incident_id: "{{rfp_id}}"
+          # severity: "{{severity}}"
+          # message: "{{message}}"
+          # session_id: "{{session_id}}"
+      # Slack escalation: posting needs a Slack adapter, which comes from a
+      # human seat's channels block. Connect Slack on Infrastructure →
+      # Messaging → Slack (vault record, e.g. 'slack_bd'), give partner_human
+      # `channels: {slack: {connection: slack_bd}}`, set SLACK_BD_CHANNEL in
+      # .env, then uncomment — here before the first start, in Studio's YAML
+      # editor after it. Shipped commented: with no adapter it delivers nothing.
+      # - type: "channel"
+        # provider: "slack"
+        # channel_id: "${SLACK_BD_CHANNEL:}"
+        # message_template: "[bd] {{message}} — rfp {{rfp_id}}"
     auto_escalate:
       max_retries: 2
       max_errors_per_session: 3
-      timeout_threshold: 2
 
   health_check_interval: 60
   agent_timeout_threshold: 300
   chain_completion_timeout: 600
-
-mesh:
-  call_timeout: 120
 
 # 2.4.131 runtime block — proposal drafting runs long (the section_drafter is a
 # super-agent that plans → drafts → verifies across many sections). The 2.4.131
 # default llm_hard_timeout_s dropped 300s → 90s, so we raise it back here.
 # (This block is REJECTED by ≤2.4.130 — it must land with the 2.4.131 floor.)
 timeouts:
+  mesh_call_default_timeout_s: 120
   llm_hard_timeout_s: 300
 
 data_structures:
@@ -286,23 +282,29 @@ agents:
     communication_type: "chain"
     # Backed by agency/opportunity_feed_agent.py: it CLAIMS a disjoint batch of
     # new notices per sweep and announces available:false when the queue is
-    # empty and no connector is wired (never a synthetic "0 new"). To go live,
-    # set OPPORTUNITY_FEED_WEBHOOK_URL — the claim then drains the n8n
-    # workflow's paged results instead of the seeded discovery queue.
-    #   integration: "n8n"
-    #   connector_config:
-    #     webhook_url: "${OPPORTUNITY_FEED_WEBHOOK_URL:}"
-    #     auth_token: "${OPPORTUNITY_FEED_AUTH_TOKEN:}"
+    # empty and no connector is wired (never a synthetic "0 new"). To put the
+    # n8n workflow in front of it: create the vault connection
+    # 'opportunity_feed_n8n' (on Infrastructure → Integrations → n8n, or an
+    # "Add custom" record with service type Tools: base URL =
+    # the workflow's webhook URL, secret = its auth token), then uncomment the
+    # three lines below (here before the first start, in Studio's YAML editor
+    # after it). A webhook URL or token written here is refused at load.
+    # integration: "n8n"
+    # connector_config:
+    #   connection: opportunity_feed_n8n
     #
     # Backlog FAN-OUT: one sweep → 2 parallel copies; each claims a DISJOINT
     # batch via store.claim_opportunities (an atomic claim — copies never
-    # double-process). instances_handoff: last COMBINES the copies (counts SUM,
+    # double-process). scaling.copies.handoff: last COMBINES the copies (counts SUM,
     # lists concatenate) so the routing below fires once on the merged sweep.
-    instances: 2
-    instances_handoff: "last"
+    scaling:                      # 2.4.484 (was instances / instances_handoff)
+      copies:
+        mode: fixed
+        count: 2
+        handoff: last
     # Scheduled daily sweep, in the firm's timezone (NOT UTC — a bare cron
     # fires at 06:00 UTC = 01:00 ET). ONE cron line is all a fanned agent needs
-    # (a cron LIST × instances would multiply the runs).
+    # (a cron LIST × copies.count would multiply the runs).
     wake_up: "0 6 * * *"
     timezone: "America/New_York"
     wake_up_input:
@@ -423,14 +425,14 @@ agents:
       practice_area: "string"
       due_date: "string"
       budget_range_cents: "object"
-      compliance_required: "list"
-      deal_breakers: "list"
+      compliance_required: {type: array, items: string}
+      deal_breakers: {type: array, items: string}
       document_count: "number"
-      requirements: "list"
+      requirements: {type: array, items: {type: object, fields: {text: string, level: string}}}
       requirements_must_count: "number"
       requirements_should_count: "number"
-      compliance_frameworks: "list"
-      deliverables: "list"
+      compliance_frameworks: {type: array, items: string}
+      deliverables: {type: array, items: string}
       evaluation_criteria: "object"
       pricing_constraints: "object"
       key_dates: "object"
@@ -516,9 +518,9 @@ agents:
       enabled: true
       groupName: "proposals_library"
     yields:
-      similar_proposals: "list"
+      similar_proposals: {type: array, items: object}
       reuse_score: "number"            # 0..1; how much we can reuse
-      matches: "list"
+      matches: {type: array, items: object}
       best_match_proposal_id: "string"
       best_match_similarity: "number"
       total_corpus_size: "number"
@@ -570,6 +572,10 @@ agents:
       the assembly order and the citation rule. Never invent a case study or a
       citation the precedent research did not return.
 
+      Each entry of "sections" is an object {"title": "", "body": ""} (title
+      e.g. "Executive summary"; body the section text). "cited_past_proposals"
+      lists the past-proposal IDs you cited.
+
       OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
       {"sections": [], "cited_past_proposals": []}
     enforce_yields: true
@@ -600,20 +606,20 @@ agents:
     # it has no real source. See agency/tools.py.
     tools: [read_reusable_sections, read_boilerplate]
     tool_categories: [drafting]
-    # ── To wire your real DMS / proposal corpus, uncomment and set the URL
-    #    (each named action under `use:` becomes its own tool). NOTE: the SDK
-    #    rejects an http mcp block with an EMPTY url at load, so this ships
-    #    commented — fill the URL, then uncomment. ──
+    # ── To wire your real DMS / proposal corpus: create the vault connection
+    #    'dms_mcp' (the DMS MCP server's URL + token) on Infrastructure →
+    #    Integrations → MCP, then uncomment — here before the first start, in
+    #    Studio's YAML editor after it (each named action under `use:` becomes
+    #    its own tool). A URL or token written here is refused at load. ──
     # mcp:
-    #   - transport: http
-    #     url: "${DMS_MCP_URL}"
-    #     token: "${DMS_MCP_TOKEN:}"
+    #   - connection: dms_mcp
+    #     transport: http
     #     use: [search_corpus, read_document]
     #     name: dms
     #     timeout: 30
     yields:
-      sections: "list"
-      cited_past_proposals: "list"
+      sections: {type: array, items: {type: object, fields: {title: string, body: string}}}
+      cited_past_proposals: {type: array, items: string}
     inputs:
       upstream_yields: "object"
     can_call:
@@ -672,7 +678,7 @@ agents:
       groupName: "rate_cards"
     yields:
       rfp_id: "string"
-      pricing_breakdown: "list"
+      pricing_breakdown: {type: array, items: {type: object, fields: {item: string, role_or_sku: string, quantity: number, unit_cents: number, subtotal_cents: number}}}
       total_cents: "number"
       within_band: "boolean"
       discount_pct: "number"
@@ -823,17 +829,17 @@ agents:
       rfp_id: "string"
       # regulatory responsibility
       clearance: "string"
-      reasons: "list"
+      reasons: {type: array, items: string}
       requires_legal_review: "boolean"
       partner_briefing: "string"
       # playbook responsibility
       clauses_reviewed: "number"
-      review: "list"
+      review: {type: array, items: object}
       severity_counts: "object"
-      unacceptable_clauses: "list"
-      negotiable_clauses: "list"
-      unmapped_clauses: "list"
-      counter_proposals: "list"
+      unacceptable_clauses: {type: array, items: string}
+      negotiable_clauses: {type: array, items: string}
+      unmapped_clauses: {type: array, items: string}
+      counter_proposals: {type: array, items: object}
       risk_score: "number"
       requires_deal_desk_review: "boolean"
 
@@ -877,11 +883,11 @@ agents:
     #   gate to the SHARED inbox. Only set real operator emails: a
     #   placeholder assigns tasks to a nonexistent operator and they
     #   never appear in anyone's inbox.
-    # DEFAULT-DENY on silence: a timeout resolves to a non-approving
-    # held_for_review, which routes to the WORM audit sink (never advances the
-    # send). The Manager SUPERVISOR (manager.escalation → partner_human) is
-    # what escalates a stalled gate — no hardcoded human→human wire (that would
-    # be a dual↔dual footgun the SDK warns on).
+    # Nothing advances on silence. If nobody answers within 2 h, the request
+    # waits no longer: its Inbox card closes and the ticket records that no
+    # reply came; nobody is chased automatically. The fallback below
+    # (held_for_review → WORM audit) is the declared intent; on SDK 2.4.486 a
+    # dual seat does not route it. No human→human wire (dual↔dual footgun).
     fallback_on_timeout: true
     fallback_response:
       human_decision: "held"
@@ -963,9 +969,11 @@ agents:
     #   gate to the SHARED inbox. Only set real operator emails: a
     #   placeholder assigns tasks to a nonexistent operator and they
     #   never appear in anyone's inbox.
-    # DEFAULT-DENY on silence → held_for_review → WORM audit. Escalation of a
-    # stalled gate is the Manager SUPERVISOR's job (manager.escalation →
-    # partner_human), not a hardcoded human→human wire (dual↔dual footgun).
+    # Nothing advances on silence. If nobody answers within 4 h, the request
+    # waits no longer: its Inbox card closes and the ticket records that no
+    # reply came; nobody is chased automatically. The fallback below
+    # (held_for_review → WORM audit) is the declared intent; on SDK 2.4.486 a
+    # dual seat does not route it. No human→human wire (dual↔dual footgun).
     fallback_on_timeout: true
     fallback_response:
       human_decision: "held"
@@ -977,6 +985,15 @@ agents:
       notes: "string"
     inputs:
       rfp_id: "string"
+    human_prompt_template: |
+      Your sign-off is needed (details above). Reply with exactly one word:
+        approve  — for a priced quote: the discount stands and the proposal
+                   continues to contracts review
+        reprice  — for a priced quote: send it back to pricing (at most 2
+                   times; after that it goes to the partner)
+        reject   — stop here; the decision is recorded
+      For a contracts review sent to you, your decision is recorded; the
+      proposal does not continue on its own.
     can_call:
       # BOUNDED BACK-EDGE (Rule 3): the practice lead can kick a quote back to
       # be re-priced. pricing_configurator COUNTS the laps and, once exhausted,
@@ -984,9 +1001,13 @@ agents:
       - agent: "pricing_configurator_agent"
         condition: "calling_agent_response.human_message == 'reprice'"
 
-      # Every other verdict (incl. the held_for_review timeout) is recorded.
+      # Discount approved on a priced quote → the proposal continues.
+      - agent: "contracts_review_agent"
+        condition: "calling_agent_response.human_message == 'approve' and calling_agent_response.from_agent == 'pricing_configurator_agent'"
+
+      # Every other verdict (reject, held, a contracts-review decision) is recorded.
       - agent: "bd_audit_logger_agent"
-        condition: "calling_agent_response.human_message != 'reprice'"
+        condition: "calling_agent_response.human_message != 'reprice' and calling_agent_response.human_message != 'approve' or calling_agent_response.human_message == 'approve' and calling_agent_response.from_agent != 'pricing_configurator_agent'"
 
   legal_human:
     name: "legal_human"
@@ -1000,7 +1021,11 @@ agents:
     #   gate to the SHARED inbox. Only set real operator emails: a
     #   placeholder assigns tasks to a nonexistent operator and they
     #   never appear in anyone's inbox.
-    # DEFAULT-DENY on silence → held_for_review → WORM audit (never proceeds).
+    # Nothing advances on silence. If nobody answers within 6 h, the Inbox
+    # card closes and the ticket records that no reply came. The fallback
+    # below is the declared intent; on SDK 2.4.486 a dual seat does not route
+    # it. Legal's decision is recorded; a cleared package is re-run from
+    # contracts review once the clause is fixed.
     fallback_on_timeout: true
     fallback_response:
       human_decision: "held"
@@ -1027,7 +1052,10 @@ agents:
     #   gate to the SHARED inbox. Only set real operator emails: a
     #   placeholder assigns tasks to a nonexistent operator and they
     #   never appear in anyone's inbox.
-    # DEFAULT-DENY on silence → held_for_review → WORM audit (never proceeds).
+    # Nothing advances on silence. If nobody answers within 8 h, the Inbox
+    # card closes and the ticket records that no reply came. The fallback
+    # below is the declared intent; on SDK 2.4.486 a dual seat does not route
+    # it.
     fallback_on_timeout: true
     fallback_response:
       human_decision: "held"
@@ -1039,15 +1067,28 @@ agents:
       directive: "string"
     inputs:
       rfp_id: "string"
+    human_prompt_template: |
+      A partner decision is needed (details above). For a priced quote over
+      $1,000,000 (or one re-priced twice), reply with exactly one word:
+        approve  — the price stands and the proposal continues to contracts review
+        reject   — stop here; the decision is recorded
+      For anything else (a new find, a deal-breaker, a bid/no-bid call, an
+      escalation), your reply is recorded; start or re-run the pursuit through
+      its entry point (manual_action) when you want it to go ahead.
     can_call:
+      # Partner approves a large / re-priced quote → the proposal continues.
+      - agent: "contracts_review_agent"
+        condition: "calling_agent_response.human_message == 'approve' and calling_agent_response.from_agent == 'pricing_configurator_agent'"
+      # Everything else is recorded.
       - agent: "bd_audit_logger_agent"
+        condition: "calling_agent_response.human_message != 'approve' or calling_agent_response.from_agent != 'pricing_configurator_agent'"
 
   bd_audit_logger_agent:
     name: "bd_audit_logger_agent"
     agent_type: "external"
     description: "Hash-chained WORM"
     framework: "custom"
-    communication_type: "execute"
+    communication_type: "chain"
     connector_config:
       sink_type: "local_file"
       local_file_path: "./logs/bd_audit.jsonl"
@@ -1127,10 +1168,10 @@ agents:
     yields:
       decision: "string"
       executive_summary: "string"
-      what_we_did_well: "list"
-      what_we_did_poorly: "list"
-      competitor_intelligence: "list"
-      learnings_for_library: "list"
+      what_we_did_well: {type: array, items: object}
+      what_we_did_poorly: {type: array, items: object}
+      competitor_intelligence: {type: array, items: object}
+      learnings_for_library: {type: array, items: object}
       next_action_for_relationship: "string"
       confidence: "number"
 
@@ -1162,12 +1203,18 @@ agents:
     description: "Competitor-signal ledger — ingest/query competitor signals in the firm's CRM / intel store via n8n"
     communication_type: "chain"
     integration: "n8n"
+    # n8n workflow against YOUR CRM / intel store (Salesforce, HubSpot, Klue,
+    # Crayon, Notion). Ingest mode creates a signal record; query mode returns
+    # signals for competitor + horizon. Day 0 the record does not exist yet. To wire it:
+    # create the vault connection 'crm_signal_n8n' (on Infrastructure →
+    # Integrations → n8n, or an "Add custom" record with service type
+    # Tools: base URL = the workflow's webhook URL, secret = its auth token),
+    # until it exists the SDK switches this agent off with a notice (it is
+    # never called without an address); it switches on, with no restart,
+    # once the record exists. A webhook URL or token written here
+    # is refused at load.
     connector_config:
-      # n8n workflow against YOUR CRM / intel store (Salesforce,
-      # HubSpot, Klue, Crayon, Notion). Ingest mode creates a signal
-      # record; query mode returns signals for competitor + horizon.
-      webhook_url: "${CRM_SIGNAL_WEBHOOK_URL:}"
-      auth_token: "${CRM_SIGNAL_AUTH_TOKEN:}"
+      connection: crm_signal_n8n
     yields:
       # Returned by your CRM workflow (lenient-filled when absent)
       status: "string"                 # ok | error
@@ -1291,8 +1338,8 @@ agents:
       overall_score: "number"
       confidence: "number"
       recommendation: "string"
-      risk_flags: "list"
-      win_themes: "list"
+      risk_flags: {type: array, items: {type: object, fields: {kind: string, note: string}}}
+      win_themes: {type: array, items: string}
       requires_partner_review: "boolean"
       decision_briefing: "string"
 
