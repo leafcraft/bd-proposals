@@ -20,7 +20,6 @@ multi-replica deployment.
 from __future__ import annotations
 
 import json
-import os
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -70,8 +69,8 @@ _OPPORTUNITY_SEED: list[dict[str, Any]] = [
         "rfp_id": "RFP-2026-08813",
         "client_org": "State Department of Transportation — Region IV",
         "practice_area": "infrastructure_advisory",
-        "received_at_utc": "2026-06-04T11:00:00Z",
-        "due_date": "2026-07-09T17:00:00Z",
+        "received_at_utc": "2026-10-27T14:00:00Z",
+        "due_date": "2026-12-04T17:00:00Z",
         # budget bounds in cents — used by the deterministic in-band check
         "budget_range_cents": {"low": 70000000, "high": 110000000},
         "compliance_required": ["NDA", "FedRAMP"],
@@ -80,7 +79,23 @@ _OPPORTUNITY_SEED: list[dict[str, Any]] = [
             "Five-year roadmap consulting for I-95 corridor modernisation — "
             "traffic modelling, environmental review, federal funding strategy."
         ),
-    }
+    },
+    # A clean pursuit (standard contract, in-band budget) — the happy path
+    # through contracts review to the proposal writer on day 0.
+    {
+        "rfp_id": "RFP-2026-09140",
+        "client_org": "Riverbend County Public Works",
+        "practice_area": "infrastructure_advisory",
+        "received_at_utc": "2026-10-30T09:30:00Z",
+        "due_date": "2026-12-11T17:00:00Z",
+        "budget_range_cents": {"low": 40000000, "high": 60000000},
+        "compliance_required": ["NDA"],
+        "fit_score": 0.76,
+        "scope_summary": (
+            "Ten-year stormwater capital plan — asset condition review, "
+            "flood-risk prioritisation, grant funding strategy."
+        ),
+    },
 ]
 
 # Past-proposal precedents — the firm's proposal corpus (DMS). Each is a
@@ -167,6 +182,24 @@ _CONTRACT_SEED: dict[str, Any] = {
              "clause_text": "Either party may terminate for convenience on 60 days written notice."},
         ],
     },
+    # Clean draft — every clause inside the playbook's acceptable stance.
+    "RFP-2026-09140": {
+        "rfp_id": "RFP-2026-09140",
+        "contract_id": "CON-2026-09140",
+        "status": "draft",
+        "clauses": [
+            {"clause_type": "liability_cap",
+             "clause_text": "Consultant's aggregate liability is capped at the fees paid in the 12 months before the claim."},
+            {"clause_type": "payment_terms",
+             "clause_text": "Client shall pay all undisputed invoices net 30 days from receipt."},
+            {"clause_type": "ip_assignment",
+             "clause_text": "Client owns all deliverables produced under this engagement; Consultant retains its pre-existing methods and tools."},
+            {"clause_type": "termination_for_convenience",
+             "clause_text": "Either party may terminate for convenience on 90 days written notice."},
+            {"clause_type": "audit_rights",
+             "clause_text": "Client may audit project records once annually on 30 days notice."},
+        ],
+    },
 }
 
 # Approved-proposal content — the drafted sections + priced package +
@@ -244,7 +277,7 @@ _APPROVED_PROPOSAL_SEED: dict[str, Any] = {
 # Win/loss history — what the bid/no-bid strategist reasons over.
 _WIN_LOSS_SEED: list[dict[str, Any]] = [
     {
-        "rfp_id": "RFP-2025-07120",
+        "rfp_id": "RFP-2024-04310",
         "client_org": "State DOT — Region II",
         "practice_area": "infrastructure_advisory",
         "decision": "won",
@@ -252,7 +285,7 @@ _WIN_LOSS_SEED: list[dict[str, Any]] = [
         "deal_size_cents": 88000000,
     },
     {
-        "rfp_id": "RFP-2025-06044",
+        "rfp_id": "RFP-2023-01880",
         "client_org": "Metro Transit Authority",
         "practice_area": "infrastructure_advisory",
         "decision": "won",
@@ -260,7 +293,7 @@ _WIN_LOSS_SEED: list[dict[str, Any]] = [
         "deal_size_cents": 64000000,
     },
     {
-        "rfp_id": "RFP-2024-05512",
+        "rfp_id": "RFP-2023-00420",
         "client_org": "County Public Works",
         "practice_area": "infrastructure_advisory",
         "decision": "lost",
@@ -506,7 +539,7 @@ _BOILERPLATE_SEED: dict[str, Any] = {
 
 # Discovery queue — the 'new since last seen' notices the capture-tool sweep
 # would return (GovWin / SAM.gov / FedConnect). The parallel opportunity_feed
-# instances CLAIM disjoint batches from this queue (dev stand-in for the
+# copies CLAIM disjoint batches from this queue (dev stand-in for the
 # connector's cursor). PROD: the n8n workflow's paged results.
 _DISCOVERY_QUEUE_SEED: list[dict[str, Any]] = [
     {"rfp_id": "RFP-2026-09001",
@@ -526,17 +559,18 @@ _DISCOVERY_QUEUE_SEED: list[dict[str, Any]] = [
 _HIGH_FIT_MIN = 0.70
 
 
-def read_reusable_sections(practice_area: str = "") -> dict[str, Any]:
+def read_reusable_sections(practice_area: str = "", connector_wired: bool = False) -> dict[str, Any]:
     """Reusable prior-proposal section prose for a practice area. Announces
-    `available: false` when there is genuinely nothing to reuse (and a real
-    DMS connector is wired but returned nothing). PROD: DMS / corpus read."""
+    `available: false` when there is genuinely nothing to reuse. The caller
+    says whether the DMS connector is wired (its vault record 'dms_mcp'
+    exists — see agency/_shared/wired.py). PROD: DMS / corpus read."""
     corpus = _seeded("reusable_sections", _REUSABLE_SECTION_SEED)
     pa = (practice_area or "").strip().lower()
     sections = corpus.get(pa) or corpus.get("_default") or []
     if not sections:
-        if os.getenv("DMS_MCP_URL"):
-            return {"available": False, "reason": "DMS connector wired but returned nothing for this practice area"}
-        return {"available": False, "reason": "no reusable sections seeded; wire DMS_MCP_URL"}
+        if connector_wired:
+            return {"available": False, "reason": "DMS connector wired — use the dms_* MCP tools for this practice area"}
+        return {"available": False, "reason": "no reusable sections seeded, and the vault record 'dms_mcp' does not exist"}
     return {"available": True, "practice_area": practice_area, "sections": sections}
 
 
@@ -550,17 +584,37 @@ def read_boilerplate(kind: str = "terms") -> dict[str, Any]:
     return {"available": True, "kind": kind, "content": value}
 
 
-def claim_opportunities(count: int = 5) -> dict[str, Any]:
+# ── Which RFP a session is about (survives the human gates) ──────────
+#    A human seat's reply carries only the verdict, so the agents behind a
+#    gate (contracts review after a partner / practice-lead approval, the
+#    assembler after the writer) recover the rfp_id from here. Persisted: an
+#    approval can take hours and the app may restart in between.
+def bind_session(session_id: str, rfp_id: str) -> None:
+    if not session_id or not rfp_id:
+        return
+    with _LOCK:
+        data = _load("sessions")
+        data[session_id] = {"rfp_id": rfp_id, "updated_at": _now()}
+        _save("sessions", data)
+
+
+def rfp_for_session(session_id: str) -> str:
+    return str((_load("sessions").get(session_id or "") or {}).get("rfp_id", ""))
+
+
+def claim_opportunities(count: int = 5, connector_wired: bool = False) -> dict[str, Any]:
     """Atomically claim up to `count` NEW opportunities from the discovery
-    queue. Each parallel `opportunity_feed_agent` instance claims a DISJOINT
+    queue. Each parallel `opportunity_feed_agent` copy claims a DISJOINT
     batch (so copies never double-process the same notice). Dev implementation
     uses a process lock + queue file; swap for Redis `LPOP count` or
     `UPDATE ... SKIP LOCKED RETURNING` in a multi-replica deployment.
 
-    Announces `available: false` when the queue is empty AND no connector is
-    wired — a stub must never fake a synthetic success.
+    Announces `available: false` when the queue is empty — a stub must never
+    fake a synthetic success. `connector_wired` (the caller checks the vault
+    record 'opportunity_feed_n8n' — agency/_shared/wired.py) only words the
+    reason; nothing here reads .env.
     """
-    connector = bool(os.getenv("OPPORTUNITY_FEED_WEBHOOK_URL"))
+    connector = bool(connector_wired)
     with _LOCK:
         data = _seeded("discovery_queue", {"items": list(_DISCOVERY_QUEUE_SEED)})
         items = data.get("items", []) if isinstance(data, dict) else []
@@ -568,7 +622,8 @@ def claim_opportunities(count: int = 5) -> dict[str, Any]:
             if connector:
                 return {"available": False, "reason": "connector wired but returned no new notices", "claimed": []}
             return {"available": False,
-                    "reason": "discovery queue empty; wire OPPORTUNITY_FEED_WEBHOOK_URL", "claimed": []}
+                    "reason": ("discovery queue empty, and the vault record "
+                               "'opportunity_feed_n8n' does not exist"), "claimed": []}
         n = max(1, int(count or 1))
         claimed = items[:n]
         data["items"] = items[n:]

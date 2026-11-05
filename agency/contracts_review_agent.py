@@ -106,6 +106,10 @@ def load_contract_context(data: Any, ctx: dict) -> dict[str, Any]:
     rfp_id = str(input_data.get("rfp_id", "") or "")
     if not rfp_id and isinstance(up, dict):
         rfp_id = str(up.get("rfp_id", "") or "")
+    if not rfp_id:
+        # After a partner / practice-lead approval the reply carries only the
+        # verdict — recover the pursuit's rfp_id for this session.
+        rfp_id = store.rfp_for_session(str((ctx or {}).get("session_id", "") or ""))
     contract = store.contract_for(rfp_id)
     return {
         "rfp_id": rfp_id,
@@ -191,6 +195,7 @@ async def enforce_unacceptable_clause_floor(result: dict, ctx: dict) -> dict[str
 
     if not result.get("rfp_id"):
         result["rfp_id"] = pctx.get("rfp_id", "")
+    store.bind_session(str((ctx or {}).get("session_id", "") or ""), str(result.get("rfp_id") or ""))
 
     logger.warning(
         f"enforce_unacceptable_clause_floor — rfp_id={result.get('rfp_id','')} "

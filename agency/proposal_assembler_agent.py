@@ -19,7 +19,7 @@ Either way the function returns a real artifact_path that exists and is
 non-empty, plus a summary.
 
 Content recovery (mirrors the PO executor's post-HITL recovery): a human
-approval gate drops upstream_yields, so the assembler resolves the
+approval step drops upstream_yields, so the assembler resolves the
 approved content from, in priority order:
   1. direct upstream_yields (no-HITL / direct-call path)
   2. the in-process session stash
@@ -147,6 +147,10 @@ def _resolve_package(input_data: dict, context: dict) -> tuple[dict, str]:
     stash = stash_get(session_id) if session_id else {}
     if not rfp_id:
         rfp_id = str(stash.get("rfp_id") or "")
+    if not rfp_id and session_id:
+        # The writer's reply carries only the verdict; the pursuit's rfp_id
+        # was bound to this session by pricing / contracts review.
+        rfp_id = store.rfp_for_session(session_id)
 
     # 3. Redis session storage.
     redis_pkg: dict = {}
