@@ -181,6 +181,7 @@ async def enforce_pricing_floor(result: dict, ctx: dict) -> dict[str, Any]:
     result["pricing_floor_applied"] = True
     if not result.get("rfp_id"):
         result["rfp_id"] = pctx.get("rfp_id", "")
+    store.bind_session(str((ctx or {}).get("session_id", "") or ""), str(result.get("rfp_id") or ""))
 
     logger.info(
         f"enforce_pricing_floor — rfp_id={result.get('rfp_id','')} "
