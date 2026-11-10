@@ -4,19 +4,20 @@ The firm's capture-tool scout. On a scheduled sweep (or a manual trigger), it
 pulls the NEW, pre-deduplicated notices from the capture tool (GovWin / SAM.gov /
 FedConnect saved searches) and routes high-fit finds to the partner.
 
-This agent runs with `instances: N` (see config.yaml): one activation fans out
+This agent runs with `scaling.copies.count: N` (see the configuration): one activation fans out
 into N parallel copies of THIS function, and each copy CLAIMS a disjoint batch
 from the discovery queue via `store.claim_opportunities` — an atomic claim so the
 copies never double-process the same notice (the doctrine's "a lease is a slot").
-With `instances_handoff: last` the SDK combines the copies deterministically
+With `scaling.copies.handoff: last` the SDK combines the copies deterministically
 (lists concatenate, `discovered_count`/`high_fit_count` SUM), so the routing
 below fires once on the merged sweep.
 
 Day-0 it reads the seeded discovery queue in the dev store and ANNOUNCES itself
 (`available: false`) when the queue is empty and no connector is wired — never a
-synthetic "0 new" that looks like a real empty sweep. To go live, set
-`OPPORTUNITY_FEED_WEBHOOK_URL` (the n8n workflow against your saved searches);
-the claim then drains the connector's paged results instead of the seed.
+synthetic "0 new" that looks like a real empty sweep. To go live, create the
+vault record 'opportunity_feed_n8n' (Infrastructure → Integrations → n8n: the
+workflow against your saved searches) and uncomment the connector lines on this
+agent; "wired" is decided by that record existing, never by .env.
 
 auto_discover matches function name 'opportunity_feed_agent' to YAML.
 """
@@ -31,13 +32,15 @@ from leafmesh import LeafMeshLogger
 
 try:
     from agency._shared import store
+    from agency._shared.wired import OPPORTUNITY_FEED_RECORD, vault_record_exists
 except ImportError:  # pragma: no cover — direct-module execution
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from _shared import store  # type: ignore[no-redef]
+    from _shared.wired import OPPORTUNITY_FEED_RECORD, vault_record_exists  # type: ignore[no-redef]
 
 logger = LeafMeshLogger(__name__)
 
-_BATCH_SIZE = 2   # each instance claims up to this many notices per sweep
+_BATCH_SIZE = 2   # each copy claims up to this many notices per sweep
                   # (small so parallel copies each get a disjoint slice day-0;
                   #  a real connector caps each claim to its page size)
 
@@ -55,7 +58,8 @@ async def opportunity_feed_agent(llm_response: Any, input_data: dict, context: d
     if not isinstance(input_data, dict):
         input_data = {}
 
-    claim = store.claim_opportunities(_BATCH_SIZE)
+    wired = await vault_record_exists(OPPORTUNITY_FEED_RECORD)
+    claim = store.claim_opportunities(_BATCH_SIZE, connector_wired=wired)
 
     # Stub announces itself: no queue + no connector => unreachable, NOT "0 new".
     if not claim.get("available"):

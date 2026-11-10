@@ -19,7 +19,7 @@ Either way the function returns a real artifact_path that exists and is
 non-empty, plus a summary.
 
 Content recovery (mirrors the PO executor's post-HITL recovery): a human
-approval gate drops upstream_yields, so the assembler resolves the
+approval step drops upstream_yields, so the assembler resolves the
 approved content from, in priority order:
   1. direct upstream_yields (no-HITL / direct-call path)
   2. the in-process session stash
@@ -45,7 +45,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from leafmesh import LeafMeshLogger, chain, load_yaml_config
+from leafmesh import LeafMeshLogger, chain
 
 try:
     from leafmesh.redis import RedisManager
@@ -147,16 +147,19 @@ def _resolve_package(input_data: dict, context: dict) -> tuple[dict, str]:
     stash = stash_get(session_id) if session_id else {}
     if not rfp_id:
         rfp_id = str(stash.get("rfp_id") or "")
+    if not rfp_id and session_id:
+        # The writer's reply carries only the verdict; the pursuit's rfp_id
+        # was bound to this session by pricing / contracts review.
+        rfp_id = store.rfp_for_session(session_id)
 
     # 3. Redis session storage.
     redis_pkg: dict = {}
     if session_id and RedisManager is not None and not (drafter and pricer):
         try:
-            cfg_path = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                "configs", "config.yaml",
-            )
-            cfg = load_yaml_config(cfg_path)
+            # The project has no configuration file: the agency's name and
+            # where its store is come from the environment (.env).
+            from leafmesh.core.config_document import boot_config_from_env
+            cfg = boot_config_from_env()
             rm = RedisManager(cfg.redis, project_name=cfg.name)
             import asyncio
 

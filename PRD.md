@@ -26,7 +26,7 @@ smarter. Every hop is appended to a tamper-evident audit trail.
 
 ```
                  ┌─────────────────────────────────────────────────────┐
-  capture tool   │  opportunity_feed  (instances: 2, each claims a      │
+  capture tool   │  opportunity_feed  (copies.count: 2, each claims a   │
   (GovWin/SAM) ─▶│    disjoint batch; live daily cron, America/NY)      │
                  │    high-fit ─▶ partner_human                         │
                  │    else      ─▶ bd_audit_logger                      │
@@ -67,10 +67,11 @@ smarter. Every hop is appended to a tamper-evident audit trail.
         proposal_assembler ─▶ renders ./out/<rfp>.{pdf,md} ─▶ bd_audit_logger
                             └─(unapproved / flagged)─▶ delete partial, status=assembly_blocked
 
-  every human gate, on silence, DEFAULT-DENIES → human_message=held_for_review
-        └──────────────────────────────────────────────▶ bd_audit_logger
-  the Manager SUPERVISOR escalates stalled gates ──▶ partner_human
-  practice_lead / legal / partner ──▶ bd_audit_logger (WORM terminus)
+  nothing advances on silence: an unanswered gate closes its Inbox card and
+        the ticket records that no reply came (nobody is chased)
+  practice_lead / partner ─(approve, on a priced quote)─▶ contracts_review
+  practice_lead / legal / partner, anything else ──▶ bd_audit_logger (WORM)
+  the Manager escalates unfixable / repeated agent errors ──▶ partner_human
 
   decision_received / competitor_takeaway / quarterly_win_rate_review
         │
@@ -88,7 +89,7 @@ smarter. Every hop is appended to a tamper-evident audit trail.
 | Agent | Role (job title) | Type |
 |---|---|---|
 | `bd_coordinator_agent` | Pursuit Coordinator | llm (gpt-4o-mini, pure YAML) |
-| `opportunity_feed_agent` | Capture-tool scout | programmatic (fan-out `instances: 2`) |
+| `opportunity_feed_agent` | Capture-tool scout | programmatic (fan-out `scaling.copies.count: 2`) |
 | `rfp_intake_agent` | Opportunity-intake specialist | llm (gpt-4o-mini) |
 | `precedent_research_agent` | Precedent researcher | llm (gpt-4o-mini) |
 | `section_drafter_agent` | Proposal drafter | llm (claude-sonnet-4-6) |
@@ -134,14 +135,15 @@ smarter. Every hop is appended to a tamper-evident audit trail.
   `rfp_intake`), answers status asks, and routes explicit escalations to
   the partner. Never scores/drafts/prices/reviews itself.
 - **opportunity_feed_agent** — backed by
-  `agency/opportunity_feed_agent.py`. **Fan-out**: `instances: 2` +
-  `instances_handoff: last` — one sweep runs as 2 parallel copies, each
+  `agency/opportunity_feed_agent.py`. **Fan-out**: `scaling.copies.count: 2` +
+  `scaling.copies.handoff: last` — one sweep runs as 2 parallel copies, each
   claiming a DISJOINT batch via `store.claim_opportunities` (an atomic
   claim; swap for Redis `LPOP count` in prod). A **live** daily cron
   (`wake_up: "0 6 * * *"`, `timezone: "America/New_York"`) sweeps day-0
-  against the seeded discovery queue and drains a real connector once
-  `OPPORTUNITY_FEED_WEBHOOK_URL` is set; it announces `available:false`
-  when the queue is empty and no URL is wired — never a synthetic "0 new".
+  against the seeded discovery queue; the n8n connector is wired with the
+  vault connection `opportunity_feed_n8n` (commented `integration` /
+  `connector_config` lines); it announces `available:false`
+  when the queue is empty and no connector is wired — never a synthetic "0 new".
   Routes on `requires_partner_review`.
 - **rfp_intake_agent** — `rfp_templates` knowledge; enforce_yields(3).
   One role, two responsibilities (normalise + extract). Routes
@@ -178,14 +180,16 @@ smarter. Every hop is appended to a tamper-evident audit trail.
 - **competitive_intel_agent** — `win_loss_archive` knowledge; sonnet.
   Briefs the practice lead; auto-forwards surfaced competitor signals to
   the ledger.
-- **competitor_signal_ledger_agent** — n8n connector; `CRM_SIGNAL_*` env.
+- **competitor_signal_ledger_agent** — n8n connector; vault connection `crm_signal_n8n` (named on the agent; day 0 the record does not exist, so the agent is switched off with a notice until it does).
   Ingest / query modes against the CRM; writes to audit on success.
-- **Human gates** — every gate DEFAULT-DENIES on silence: the timeout
-  `fallback_response` resolves to `human_message: held_for_review`, which
-  routes to the WORM audit sink (never advances anything). Timeouts: writer
-  2h, practice lead 4h, legal 6h, partner 8h. Escalation of a stalled gate
-  is the Manager SUPERVISOR's job (`manager.escalation → partner_human`) —
-  there are no human→human `can_call` wires (a `dual→dual` footgun the SDK
+- **Human gates** — nothing advances on silence. Timeouts: writer 2h,
+  practice lead 4h, legal 6h, partner 8h; when one runs out the Inbox card
+  closes and the ticket records that no reply came — nobody is chased
+  automatically. The declared `fallback_response` (`held_for_review` →
+  audit) is kept; on SDK 2.4.486 a dual seat does not route it. A partner
+  or practice-lead `approve` on a priced quote continues to contracts review
+  (the rfp_id is recovered for the session from the dev store); every other
+  reply is recorded. There are no human→human `can_call` wires (a `dual→dual` footgun the SDK
   warns on). The practice lead can send a quote back to pricing (`reprice`)
   — a **bounded** back-edge (see below). No `operator_ids` set → tasks
   route to the shared inbox.
@@ -215,10 +219,11 @@ direct-call entries for ad-hoc invocation of the drafting-chain agents and
 
 ## Controls & trust
 
-- **Human gates default-deny on silence**: the timeout `fallback_response`
-  resolves to `held_for_review`, routed to the WORM audit sink — silence
-  never advances a pursuit. The Manager SUPERVISOR escalates a stalled gate
-  to the partner; no human→human wires (no `dual→dual` ping-pong).
+- **Silence never advances a pursuit**: an unanswered gate closes its Inbox
+  card and the ticket records that no reply came; nobody is chased
+  automatically. The Manager escalates only agent errors (unfixable, or 3
+  failed agents in one session) to the partner; no human→human wires (no
+  `dual→dual` ping-pong).
 - **The finisher fails closed**: the proposal assembler re-checks the
   approval token (allow/deny lists, unknown ⇒ blocked), enforces
   compliance/pricing invariants, and DELETES a partial artifact on a
@@ -240,18 +245,20 @@ direct-call entries for ad-hoc invocation of the drafting-chain agents and
   success.
 - **WORM audit on every terminus**: hash-chained so any insertion or
   deletion is detectable post-hoc.
-- **Manager escalation** (learning router, fallback all) to human +
-  webhook (PagerDuty) + slack channel.
+- **Manager escalation** (learning router, fallback all) to the partner's
+  Inbox; the Slack channel target (needs a Slack adapter on a human seat)
+  and a webhook (PagerDuty) target ship commented — create vault
+  connection `escalation_webhook`, then uncomment it (in Studio's raw YAML editor — no restart).
 
 ## Configuration pointer
 
 See **README.md → Configuration** for the three-tier env breakdown
 (boot / host-adapters / connectors). Most wiring lives in
-`configs/config.yaml`; the Python is the deterministic-floor modules +
+the agency's configuration; the Python is the deterministic-floor modules +
 `proposal_assembler_agent.py` (finisher) + `opportunity_feed_agent.py`
 (fan-out claim) + `tools.py` (the drafter's day-0 tool surface), all
 auto-discovered, plus `agency/_shared/` (audit sink, dev store, session
-stash). `main.py` imports `agency.tools` before `from_yaml` so the
+stash). `main.py` imports `agency.tools` before `from_store()` so the
 `@global_tool`s register.
 
 ## Modern SDK capabilities (2.4.131), fitted to the domain
@@ -260,9 +267,9 @@ stash). `main.py` imports `agency.tools` before `from_yaml` so the
 |---|---|---|
 | **super_agent** (dict form) | `section_drafter_agent` | Drafting a full proposal is autonomous plan → draft → verify across many sections; bounded by `cost_ceiling` + `wall_clock` (its own bounded loop) |
 | **playbook** (on-demand) | `section_drafter` (`draft_sections`), `bid_no_bid` (`win_themes`) | The craft lives behind a `load_skill_reference` call — only the `description` rides in the prompt, so the prompt stays identity+contract and the how-to doesn't compete with it |
-| **instances + atomic claim** | `opportunity_feed_agent` | A morning's discovery queue is a backlog; 2 parallel copies each claim a disjoint slice (`store.claim_opportunities`) so nothing is double-processed |
+| **scaling.copies + atomic claim** | `opportunity_feed_agent` | A morning's discovery queue is a backlog; 2 parallel copies each claim a disjoint slice (`store.claim_opportunities`) so nothing is double-processed |
 | **timezone** | `opportunity_feed_agent` | The live daily sweep cron fires at 06:00 `America/New_York`, not UTC (a bare cron would fire at 01:00 local) |
-| **tools + commented mcp** | `section_drafter_agent` | Day-0 dev-store tools (`agency/tools.py`, self-announcing) pull reusable prose/boilerplate; the DMS `mcp` block ships commented (the SDK rejects an empty-URL `mcp` at load) |
+| **tools + commented mcp** | `section_drafter_agent` | Day-0 dev-store tools (`agency/tools.py`, self-announcing) pull reusable prose/boilerplate; the DMS `mcp` block ships commented — it picks the vault connection `dms_mcp` (Infrastructure → Integrations → MCP; a URL/token inline is refused at load) |
 | **finisher** | `proposal_assembler_agent` | Approve-token re-check (fail closed) → invariants → render `./out` → delete-on-block → dev-store recovery |
 
 ## Deterministic floors (the depth)
@@ -337,8 +344,8 @@ the bounded-loop scratch (`agency/_shared/session_stash.py`).
 
 ### Open items for a live smoke test
 
-- Whether the slack channel escalation target actually posts with
-  `SLACK_BOT_TOKEN` + `SLACK_BD_CHANNEL` (SDK-provider behaviour, not
-  introspectable from config).
-- End-to-end behaviour of the n8n connectors once real webhook URLs are
-  wired (shape of returned notices / signals).
+- The Slack channel escalation target (shipped commented) once Slack is
+  connected on `partner_human`'s `channels:` block and `SLACK_BD_CHANNEL`
+  is set.
+- End-to-end behaviour of the n8n connectors once their vault connections
+  are created (shape of returned notices / signals).

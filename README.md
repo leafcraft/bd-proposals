@@ -14,13 +14,14 @@ precedent citation are enforced by construction, not hoped for in a prompt.
 The pod also fits the modern SDK capabilities to the work: the section
 drafter is a **super-agent** (plan → draft → verify) with a **playbook**
 (loaded on demand) and day-0 **tools**; the opportunity feed **fans out**
-across parallel `instances` with an atomic claim; the daily sweep cron
+across parallel copies (`scaling.copies`) with an atomic claim; the daily sweep cron
 carries a **timezone**. A seeded dev store + self-announcing tools let the
 whole pod run on day 0 with no connectors wired.
 
 **The discipline, in one line: agents produce, humans decide, systems
-record — and silence never advances anything** (every HITL gate
-default-denies to `held_for_review`, routed to the WORM audit sink).
+record — and silence never advances anything** (if nobody answers a gate
+in time, its Inbox card closes and the ticket records that no reply came;
+nothing is approved or sent, and nobody is chased automatically).
 
 ## Story
 
@@ -29,8 +30,9 @@ GovWin and SAM.gov saved searches surface new federal RFPs, and the
 **opportunity feed** pulls them in pre-deduplicated and fit-scored — running
 as two parallel copies that each claim a disjoint slice of the morning's
 notices. Because one find's fit is high, it goes straight to Priya as
-**partner** for triage; she nudges it into the pipeline, where the
-**pursuit coordinator** opens the case and hands it to intake.
+**partner** for triage; she opens a pursuit for it (the `manual_action`
+entry point), and the **pursuit coordinator** opens the case and hands it to
+intake.
 
 **RFP intake** normalises the notice — client, practice area, due date,
 budget — and in the same pass extracts structured requirements from the
@@ -87,51 +89,70 @@ Three tiers. Copy `env` to `.env` and fill in by tier.
   backbone (defaults: `localhost` / `6379` / empty).
 
 **Tier 2 — Host prereqs / adapters (optional, recommended).** Manager
-escalation targets in `configs/config.yaml`.
-- `PAGER_WEBHOOK` — PagerDuty (or any) incident webhook for hard
-  escalations (defaults to the PagerDuty enqueue URL).
-- `SLACK_BD_CHANNEL` + `SLACK_BOT_TOKEN` — set BOTH to enable the slack
-  channel escalation target; the token authenticates the post.
-- `SLACK_SIGNING_SECRET` — only needed if you add a slack *inbound*
-  webhook (none ship here); leave unset otherwise.
+escalation targets in the configuration.
+- Webhook escalation (PagerDuty or any incident webhook) for hard
+  escalations — no env var: create vault connection `escalation_webhook`
+  (an "Add custom" record on the Infrastructure page, service type
+  'Outbound webhook'), then uncomment the webhook target (in Studio's raw YAML editor).
+- Slack escalation — ships **commented** (day 0 the partner gets every
+  escalation in the Inbox). Connect Slack on Infrastructure → Messaging →
+  Slack (bot token and signing secret live only in that vault record), give
+  `partner_human` `channels: {slack: {connection: <name>}}`, set
+  `SLACK_BD_CHANNEL` in `.env`, then uncomment the channel target (in Studio's raw YAML editor). Without a Slack adapter the target cannot deliver anything.
 
 **Tier 3 — Connectors (optional; wire to your systems).** The pod runs
 day-0 without these: `opportunity_feed_agent` claims from the seeded
 discovery queue (and announces `available:false` when it is drained and no
-URL is set — never a fake "0 new"); `section_drafter_agent`'s tools read
-the seeded reusable-content store; the competitor ledger is inert until
-wired.
-- `OPPORTUNITY_FEED_WEBHOOK_URL` + `OPPORTUNITY_FEED_AUTH_TOKEN` — the
-  n8n workflow that queries your GovWin / SAM.gov / FedConnect saved
-  searches. The `wake_up: "0 6 * * *"` cron (timezone `America/New_York`)
-  is **live** — it sweeps the seed day-0 and drains your connector once
-  wired. Uncomment the `integration`/`connector_config` block on
-  `opportunity_feed_agent` to point the claim at your n8n workflow.
-- `DMS_MCP_URL` + `DMS_MCP_TOKEN` — your DMS / proposal corpus. Fill the
-  URL, then **uncomment** the `mcp` block on `section_drafter_agent` (the
-  SDK rejects an empty-URL `mcp` block at load, so it ships commented).
-- `CRM_SIGNAL_WEBHOOK_URL` + `CRM_SIGNAL_AUTH_TOKEN` — the n8n workflow
-  against your CRM / intel store (Salesforce, HubSpot, Klue, Crayon,
-  Notion) for the competitor-signal ledger (ingest / query).
+connector is wired — never a fake "0 new"); `section_drafter_agent`'s tools
+read the seeded reusable-content store; the competitor ledger is inert until
+wired. Addresses and tokens live **only in the vault**: create each
+connection (Infrastructure → Integrations → n8n / MCP), then uncomment its block —
+in Studio's raw YAML editor (see *Changing the configuration*). A URL or token
+written in the config is refused at load.
+- Vault connection `opportunity_feed_n8n` (Infrastructure → Integrations → n8n, or an "Add custom"
+  record with service type Tools: base URL = the workflow's webhook URL,
+  secret = its auth token) — the n8n workflow that queries your GovWin /
+  SAM.gov / FedConnect saved searches. Uncomment the
+  `integration`/`connector_config` lines on `opportunity_feed_agent`. The
+  `wake_up: "0 6 * * *"` cron (timezone `America/New_York`) is **live** — it
+  sweeps the seed day-0. The feed counts as wired as soon as the vault
+  record `opportunity_feed_n8n` exists — nothing in `.env`.
+- Vault connection `dms_mcp` (the DMS MCP server's URL + token) — your DMS /
+  proposal corpus. Then **uncomment** the `mcp` block on
+  `section_drafter_agent`.
+- Vault connection `crm_signal_n8n` (same shape as above) — the n8n
+  workflow against your CRM / intel store (Salesforce, HubSpot, Klue,
+  Crayon, Notion) for the competitor-signal ledger (ingest / query). Then
+  uncomment the `connector_config` lines on `competitor_signal_ledger_agent`.
 
 ```bash
-cp env .env && pip install -r requirements.txt && python main.py
+# With Docker — starts Redis, loads the team into it once, starts the agency:
+create-leafmesh --start .
+
+# Without Docker — your own Redis (REDIS_* in .env):
+pip install -r requirements.txt
+create-leafmesh --load .                 # loads the team into that Redis (only if it is empty)
+python main.py                           # API at http://127.0.0.1:18820/docs
 ```
+
+API calls (from `/docs`, curl or a script) need your organisation's API key in the `X-API-Key` header: make one in Studio → API Keys → Generate Key, then `export LEAFCRAFT_API_KEY=<the key>` for the examples below. The agency itself runs without it.
 
 ## Run it (day 0, no connectors)
 
-The dev store (`agency/_shared/store.py`) ships seeded with a sample
-opportunity (`RFP-2026-08813`), three proposal precedents, a rate card,
+The dev store (`agency/_shared/store.py`) ships seeded with sample
+opportunities (`RFP-2026-08813`, `RFP-2026-09140`), three proposal precedents, a rate card,
 and win/loss history — so the full chain runs before any external system
-is wired. With the mesh booted (`python main.py`), kick the captured RFP
+is wired. With the mesh booted (see the run steps above), kick the captured RFP
 into intake:
 
 ```python
 import asyncio
+from dotenv import load_dotenv
 from leafmesh import LeafMesh
 from agency._shared import audit_logger
 
-mesh = LeafMesh.from_yaml("configs/config.yaml")
+load_dotenv()
+mesh = LeafMesh.from_store()   # name + store from .env, configuration from the store
 audit_logger.register(mesh, "bd_audit_logger_agent")
 
 async def go():
@@ -152,20 +173,26 @@ draft → pricing → contracts) and the post-mortem scenarios with the
 bundled payloads:
 
 ```bash
+# after the team is loaded (see the run steps above)
 python examples/run_examples.py            # all scenarios
 python examples/run_examples.py 01         # one scenario
 ```
 
 The seeded numbers exercise the floors directly: `RFP-2026-08813` carries
-an `FedRAMP` compliance must-have (unioned in by the intake floor) and a
-$70M–$110M budget band (the pricing floor's in-band check).
+a `FedRAMP` compliance must-have (unioned in by the intake floor), a
+$700k–$1.1M budget band (the pricing floor's in-band check), and a draft
+contract with uncapped liability, so contracts review sends it to legal.
+`RFP-2026-09140` (Riverbend County Public Works, $400k–$600k, standard
+contract) is the clean pursuit: it reaches the proposal writer. The seeded
+approved package for `RFP-2026-08813` prices 250 days at the rate card
+($920,000, 6% discount — inside the band and under both sign-off tiers).
 
 ## Agents
 
 | Agent | Role (human job title) | Responsibilities | Can perform |
 |---|---|---|---|
 | `bd_coordinator_agent` | Pursuit Coordinator | Owns each RFP pursuit end to end; opens the case, orchestrates the pod, keeps live status, is BD's single point of contact | LLM (pure YAML); opens the pursuit → intake, routes escalations to the partner; **never scores, drafts, prices, or reviews itself** |
-| `opportunity_feed_agent` | Capture-tool scout | Pulls new, pre-deduplicated, fit-scored RFP notices from the firm's GovWin / SAM.gov / FedConnect saved searches | Programmatic; **fans out across 2 parallel `instances`**, each claiming a disjoint batch (atomic claim); **live daily cron** (`America/New_York`); dev-store fallback that announces `available:false`; routes high-fit finds to the partner, else the audit log |
+| `opportunity_feed_agent` | Capture-tool scout | Pulls new, pre-deduplicated, fit-scored RFP notices from the firm's GovWin / SAM.gov / FedConnect saved searches | Programmatic; **fans out across 2 parallel copies** (`scaling.copies.count: 2`), each claiming a disjoint batch (atomic claim); **live daily cron** (`America/New_York`); dev-store fallback that announces `available:false`; routes high-fit finds to the partner, else the audit log |
 | `rfp_intake_agent` | Opportunity-intake specialist | Normalises an inbound RFP (client, practice area, due date, budget) AND extracts structured requirements from attachments with must/should/may classification + completeness scoring | `gpt-4o-mini` over `rfp_templates` knowledge; routes deal-breakers / incomplete extraction to the partner, clean packages to precedent research |
 | `precedent_research_agent` | Precedent researcher | Retrieves similar prior wins and the top proposal-library matches as RAG context for drafting; never invents proposals retrieval didn't return | `gpt-4o-mini` over `proposals_library` (the firm's DMS); hands the corpus to the section drafter |
 | `section_drafter_agent` | Proposal drafter | Plans and writes each required section (exec summary, approach, team bios, timeline, case studies) citing past proposals | `claude-sonnet-4-6` **super-agent** (plan → draft → verify, bounded by cost/wall-clock) + **`draft_sections` playbook** (on-demand craft) + day-0 **tools** (reusable prose / boilerplate) + commented DMS `mcp`; hands the draft to pricing |
@@ -174,17 +201,127 @@ $70M–$110M budget band (the pricing floor's in-band check).
 | `bid_no_bid_decisioner_agent` | Bid/no-bid strategist | Scores RFP fit on five axes → bid / qualify further / no-bid; never silently no-bids on a weak signal | `gpt-4o-mini` over `rfp_decision_playbook` + a **`win_themes` playbook** (on-demand craft) + `@chain` decision floor; routes low-confidence to the partner, a "bid" verdict to the section drafter |
 | `competitive_intel_agent` | Competitive-intelligence analyst | Runs win/loss post-mortems and quarterly reviews; surfaces competitor signals and learnings | `claude-sonnet-4-6` over `win_loss_archive`; briefs the practice lead, auto-forwards surfaced signals to the CRM ledger |
 | `competitor_signal_ledger_agent` | Competitor-signal registrar | Ingests one competitor signal into / queries signals from the firm's CRM intel store (ingest / query modes) | n8n connector against the CRM; writes the result to the audit log on success |
-| `proposal_writer_human` | Proposal writer | Final polish and approve/send of the proposal | Human gate (2h timeout, **default-deny → `held_for_review` → audit**); an approval routes to the assembler (finisher) |
-| `practice_lead_human` | Practice lead | Pricing and practice-area sign-off | Human gate (4h timeout, **default-deny → `held_for_review` → audit**); can send a quote back to pricing (`reprice`, a **bounded** back-edge); else records to audit |
-| `legal_human` | Legal counsel | Compliance / IP / regulator review on any hard-gated package | Human gate (6h timeout, **default-deny → `held_for_review` → audit**) |
-| `partner_human` | Partner | Sign-off on high-value deals and deal-breakers | Human gate (8h timeout, **default-deny → `held_for_review` → audit**); also the Manager's escalation target for stalled gates |
+| `proposal_writer_human` | Proposal writer | Final polish and approve/send of the proposal | Human gate (2 h; nothing is sent on silence); an approval routes to the assembler (finisher), which re-checks it |
+| `practice_lead_human` | Practice lead | Discount sign-off (> 20%) and contracts needing review | Human gate (4 h); `approve` on a quote → contracts review; `reprice` → pricing (a **bounded** back-edge, 2 laps then the partner); anything else → audit |
+| `legal_human` | Legal counsel | Compliance / IP / regulator review on any hard-gated package | Human gate (6 h); the decision is recorded → audit (a fixed package is re-run from contracts review) |
+| `partner_human` | Partner | Sign-off on quotes over $1,000,000, deal-breakers, high-fit finds, bid/no-bid calls | Human gate (8 h); `approve` on a quote → contracts review; anything else → audit; also the Manager's escalation target |
 | `proposal_assembler_agent` | Proposal assembler (the finisher) | Renders the APPROVED package into a real document at `./out` | Programmatic **finisher**: approve-token re-check (allow/deny lists, fail closed) → compliance/pricing invariants → render PDF/Markdown → **delete-on-block** → dev-store recovery across the HITL boundary; terminus → audit |
 | `bd_audit_logger_agent` | Audit registrar | Appends every terminal hop to a hash-chained, append-only (WORM) audit trail | Custom external sink → `./logs/bd_audit.jsonl` (swap for S3 Object Lock / Splunk / Datadog in prod); terminal |
 
-The **LeafMesh Manager** supervises — it reads every hand-off and escalates
-stalls / contract violations / repeated errors to the partner automatically
-(`manager.escalation`), so a stalled human gate is escalated by the
-supervisor, not by a hardcoded human→human wire.
+The **LeafMesh Manager** supervises. It escalates to the partner
+(`manager.escalation`) when an agent hits an error a retry cannot fix (auth,
+bad request, credit, bad config), when 3 different agents fail in one
+session, or when restarts run out. A hand-off that misses its contract
+raises an alert, not an escalation. It does **not** chase an unanswered
+gate: if nobody answers in time (writer 2 h, practice lead 4 h, legal 6 h,
+partner 8 h), the Inbox card closes and the ticket records that no reply
+came — nothing advances.
 
 See **PRD.md** for the flow diagram, per-agent specs, data artifacts, and
 design decisions.
+
+## Changing the configuration
+
+The agency's configuration lives in its store (Redis), not in a file: this project ships no configuration file. `create-leafmesh --start` loads the team's configuration into the store once, while the store is still empty (`leafmesh config import --if-empty`). `main.py` reads it from the store at start (`LeafMesh.from_store()`). A later start never replaces it, so what you change in Studio is kept.
+
+To change it:
+
+- **Studio** — its settings pages, or the raw YAML editor.
+- **CLI** — `leafmesh config export > config.yaml`, edit it, then `leafmesh config import config.yaml` (it is checked before it is saved). `leafmesh config check`, `versions` and `rollback` check, list and restore versions.
+- **API** — `PUT /api/yaml/raw` with an `X-API-Key` header and the body `{"yaml_content": "<the whole YAML>", "save_to_disk": true}`, or `PATCH /api/yaml/config` with `{"updates": {...}, "save_to_disk": true}`. Despite its name, `save_to_disk: true` saves the change to the store as a new version; without it the change is held only in memory and lost on restart.
+
+Each save is a new version and applies live on every pod — no restart. (A few settings, such as brokers, make the agency reload itself in place within seconds.)
+
+## Changing a running project (Docker)
+
+What reaches a project that is already running (leafmesh 2.4.497). The
+image holds the Python code (no configuration file); `.env` is passed in
+when the container is created; the store (Redis) keeps the configuration
+and the data on its own volume.
+
+| You change | When it applies |
+|---|---|
+| An agent in Studio (prompt, model, tools, routes, human seats, schedules, …) | At once, no restart |
+| A human seat's `channels` (Slack, email, …) | The agency reloads itself in place within seconds |
+| Add or delete an agent in Studio | At once, including routes and schedules |
+| A connection in the vault (model keys, MCP, webhooks, connectors, Slack, email) | At once. An agent switched off for a missing connection or address switches back on by itself |
+| Anything in `.env` (licence, agency name, store, ports) | After `docker compose up -d` (the container is recreated) |
+| Python code (`agency/*.py`: programmatic agents, tools, `@pre_compose`) | After a rebuild: `docker compose up -d --build` |
+| The team's starting configuration | Loaded once by `create-leafmesh --start` into an empty store; after that, change it in Studio |
+| Several app containers on one store | A Studio save reaches every one within about 15 seconds |
+
+- Keep model keys in the vault. A key there wins over the same key in
+  `.env` (the log warns), and a change applies at once. From 2.4.497 that
+  holds for every value the vault holds (endpoints, organisation / project
+  ids, cloud identities); the `.env` value returns when the record goes.
+- Code the image does not have: an agent marked pure Python
+  (`integration: python`) is switched off until its function is in the image;
+  any other programmatic agent stays on, and each call to code it does not
+  have fails. Rebuild the image with the code first.
+- A new Redis volume is an empty store, so `create-leafmesh --start` loads
+  the team again as version 1.
+- **If the agency refuses to start after an upgrade** (a new leafmesh pin,
+  then a rebuild: "Configuration has N error(s) in the stored
+  configuration"), repair the stored configuration with the agency stopped:
+
+  ```bash
+  docker compose run --rm bd-proposals leafmesh config check      # each problem, with its line
+  docker compose run --rm bd-proposals leafmesh config versions   # kept versions: which pass, which is in use
+  docker compose run --rm bd-proposals leafmesh config rollback   # back to the newest version that passes (saved as a new version)
+  ```
+
+  Or `leafmesh config export > config.yaml`, fix it by hand, then
+  `leafmesh config import config.yaml` (it is checked before it is saved).
+
+## Where the data store is set
+
+From leafmesh 2.4.482 the store (Redis or Postgres) is set **only in `.env`** — never in the agency's configuration. A `persistence:` block in the YAML is ignored with a warning on leafmesh 2.4.482–2.4.485; from 2.4.486 the agency refuses to start if that block differs from `.env`, and names each `.env` line to add. The project's `.env` sets the store explicitly (`LEAFMESH_STORE`, `LEAFMESH_AGENCY_NAME`, `REDIS_*`).
+
+- Redis (default): `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`, `REDIS_DB`; optional `REDIS_DEFAULT_TTL`, `REDIS_SESSION_TTL`, `REDIS_SSL*`, `REDIS_CLUSTER_NODES`.
+- Postgres instead: `LEAFMESH_STORE=postgres` plus `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` (optional `POSTGRES_SSLMODE`).
+- Or the whole server in one value: `REDIS_URL=redis://user:pw@host:6379/0` (`rediss://` turns TLS on) or `DATABASE_URL=postgresql://user:pw@host:5432/db`. The single names fill in what the URL leaves out.
+- With Docker Compose the app reaches Redis as `redis` (the service name); compose sets that for you.
+- Check it in Studio → **Infrastructure → Datastores**: it shows whether the store is reachable (never the address or password).
+
+## This mesh's sign-in (leafmesh 2.4.497)
+
+From leafmesh 2.4.497 each mesh signs in to LeafCraft with its own key, not
+a key shared by every install.
+
+- **First start.** The mesh makes a key pair and registers it with
+  `LEAFMESH_LICENSE_KEY` and `LEAFMESH_ENV_TOKEN` from `.env` (copy the
+  environment token from Studio — a placeholder such as `development` is
+  refused). With both valid it works at once. If your organisation turned on
+  "require approval", the first start stops and says so: approve it in
+  Studio → **Keys → SDK access**, then start again. Organisation admins get an
+  email for every new registration.
+- **Where the key lives.** In the vault, in the store, encrypted with
+  `LEAFMESH_VAULT_KEY`: it survives rebuilds and every copy of the app shares
+  it. A new Redis volume, or a new vault key, makes a new key pair that
+  registers again — revoke the old one in Studio.
+- **Check or change it** (in Docker: `docker compose run --rm bd-proposals leafmesh auth status`):
+  - `leafmesh auth status` — credential id, key fingerprint, registration and
+    mode, never a key; `--check` signs in now and reports the tokens.
+  - `leafmesh auth register` — register now.
+  - `leafmesh auth rotate` — a new key pair: once it is active the mesh
+    switches to it and revokes the old one. A revoked or expired key is never
+    revived; rotate instead.
+- **Lost the environment token?** From 5 Dec 2026 Studio shows the licence
+  key and environment token only once, when they are made (then only a hint).
+  Rotate the environment token in Studio and put the new one in `.env`.
+  Rotating it changes where the agency's data is kept in the store, so do it
+  before the agency holds data.
+- **An existing project whose `.env` says `LEAFMESH_ENV_TOKEN=development`.**
+  2.4.497 needs the real token. The token also names where the agency's data
+  sits in the store, so with the real token the agency starts on an empty
+  store (vault, sessions, board) — the old data stays under the old name. Set
+  the real token before you put data in the agency, or contact us to move it.
+
+## Your vault key — back it up
+
+`create-leafmesh` put a `LEAFMESH_VAULT_KEY` in your `.env` when it made this project. It is the master key that encrypts every connection and credential you store in the vault (in Redis / Postgres).
+
+- **Back it up like a master password.** Lose it and every stored connection has to be entered again.
+- **Never change or regenerate it** for an existing project — a new key locks the existing vault. To change it, use `leafmesh vault rotate-key`.
+- Every copy of the app (every replica) must get the **same** value. Docker Compose passes it in from `.env` as an environment variable.
+- Never commit `.env` (it is already in `.gitignore`).
