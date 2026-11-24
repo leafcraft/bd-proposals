@@ -108,9 +108,14 @@ def _resolve_package(input_data: dict, context: dict) -> tuple[dict, str]:
             or {}
         )
 
-    # The human verdict from proposal_writer_human (or a direct call).
+    # The human verdict from proposal_writer_human (or a direct call). Since
+    # 2.4.528 the seat's reply_reader puts it in `verdict` (one word); the
+    # person's own words in human_message are only read when there is none.
     human_message = str(
-        input_data.get("human_message")
+        input_data.get("verdict")
+        or context.get("verdict")
+        or upstream.get("verdict", "")
+        or input_data.get("human_message")
         or context.get("human_message")
         or upstream.get("human_message", "")
         or ""

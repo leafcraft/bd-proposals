@@ -17,7 +17,7 @@ Decorators (bottom-up execution):
       captured RFP's budget bounds from the dev store so the model prices
       against real day-rates (not invented ones) and the band check has
       real bounds.
-  @compose per-peer payloads — the partner / practice-lead approvers get
+  @compose per-peer payloads — the partner / practice-lead decision-makers get
       a focused approval brief; contracts_review gets the full priced
       package.
   @chain enforce_pricing_floor — recompute total / band / approval tiers
@@ -194,7 +194,7 @@ async def enforce_pricing_floor(result: dict, ctx: dict) -> dict[str, Any]:
 
 # ── @compose per-peer payloads ───────────────────────────────────────
 def _to_approver(result: dict, ctx: dict) -> dict[str, Any]:
-    """Focused approval brief for the partner / practice-lead human gate."""
+    """Focused approval brief for the partner / practice-lead human step."""
     return {
         "rfp_id": result.get("rfp_id", ""),
         "total_cents": result.get("total_cents", 0),
@@ -239,7 +239,8 @@ async def pricing_configurator_agent(llm_response, input_data: dict,
     # the floor can force a terminal partner sign-off once exhausted.
     sid = str(context.get("session_id") or input_data.get("session_id") or "")
     signal = str(
-        input_data.get("human_message") or input_data.get("decision") or ""
+        input_data.get("verdict") or input_data.get("human_message")
+        or input_data.get("decision") or ""
     ).strip().lower()
     reprice_laps = bump(sid, "reprice_laps") if signal == "reprice" else peek(sid, "reprice_laps")
 

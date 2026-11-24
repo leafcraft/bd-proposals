@@ -5,7 +5,7 @@
 A complete RFP-response department modelled as a LeafMesh agency. A
 request for proposal enters through one of several channels, is normalised
 and requirement-extracted, researched against the firm's prior wins,
-drafted, priced, compliance-reviewed, and sent — with human gates at every
+drafted, priced, compliance-reviewed, and sent — with human steps at every
 irreversible decision and a hash-chained WORM audit on every terminal
 branch. The firm's existing systems remain the source of truth: the
 capture tool owns the opportunity watchlist and dedup, the DMS owns the
@@ -63,12 +63,12 @@ smarter. Every hop is appended to a tamper-evident audit trail.
 
   practice_lead ─(reprice, BOUNDED)─▶ pricing_configurator   # laps counted →
                                        # exhaustion forces a terminal partner sign-off
-  proposal_writer ─(approved, not held)─▶ proposal_assembler (FINISHER)
+  proposal_writer ─(verdict approve)─▶ proposal_assembler (FINISHER)
         proposal_assembler ─▶ renders ./out/<rfp>.{pdf,md} ─▶ bd_audit_logger
                             └─(unapproved / flagged)─▶ delete partial, status=assembly_blocked
 
-  nothing advances on silence: an unanswered gate closes its Inbox card and
-        the ticket records that no reply came (nobody is chased)
+  nothing advances on silence: an unanswered gate's default reply (hold)
+        goes to bd_audit_logger (nobody is chased)
   practice_lead / partner ─(approve, on a priced quote)─▶ contracts_review
   practice_lead / legal / partner, anything else ──▶ bd_audit_logger (WORM)
   the Manager escalates unfixable / repeated agent errors ──▶ partner_human
@@ -182,15 +182,19 @@ smarter. Every hop is appended to a tamper-evident audit trail.
   the ledger.
 - **competitor_signal_ledger_agent** — n8n connector; vault connection `crm_signal_n8n` (named on the agent; day 0 the record does not exist, so the agent is switched off with a notice until it does).
   Ingest / query modes against the CRM; writes to audit on success.
-- **Human gates** — nothing advances on silence. Timeouts: writer 2h,
-  practice lead 4h, legal 6h, partner 8h; when one runs out the Inbox card
-  closes and the ticket records that no reply came — nobody is chased
-  automatically. The declared `fallback_response` (`held_for_review` →
-  audit) is kept; on SDK 2.4.486 a dual seat does not route it. A partner
+- **Human steps** — nothing advances on silence. Timeouts: writer 2h,
+  practice lead 4h, legal 6h, partner 8h; when one runs out the seat's
+  `fallback_response` (`verdict: hold`, `held_for_review`) goes through its
+  routes like any reply and is recorded in the audit log — nobody is chased
+  automatically. Every seat is `chain` with a `reply_reader`
+  (`gpt-4o-mini`): the person types a reply and the reader turns it into a
+  `verdict` (`approve` / `reprice` / `hold`, by seat); `hold` covers no, not
+  now or wait; `answer` (the person answered an agent's question) goes back
+  to only the agent that asked. A partner
   or practice-lead `approve` on a priced quote continues to contracts review
   (the rfp_id is recovered for the session from the dev store); every other
-  reply is recorded. There are no human→human `can_call` wires (a `dual→dual` footgun the SDK
-  warns on). The practice lead can send a quote back to pricing (`reprice`)
+  reply is recorded. There are no human→human `can_call` wires; escalation
+  goes through the coordinator or the Manager. The practice lead can send a quote back to pricing (`reprice`)
   — a **bounded** back-edge (see below). No `operator_ids` set → tasks
   route to the shared inbox.
 - **proposal_assembler_agent** — the artifact-producing **finisher**
@@ -219,11 +223,10 @@ direct-call entries for ad-hoc invocation of the drafting-chain agents and
 
 ## Controls & trust
 
-- **Silence never advances a pursuit**: an unanswered gate closes its Inbox
-  card and the ticket records that no reply came; nobody is chased
-  automatically. The Manager escalates only agent errors (unfixable, or 3
-  failed agents in one session) to the partner; no human→human wires (no
-  `dual→dual` ping-pong).
+- **Silence never advances a pursuit**: an unanswered question to a person's default reply
+  (`hold`) is recorded in the audit log; nobody is chased automatically. The
+  Manager escalates only agent errors (unfixable, or 3 failed agents in one
+  session) to the partner; no person seat calls another person seat.
 - **The finisher fails closed**: the proposal assembler re-checks the
   approval token (allow/deny lists, unknown ⇒ blocked), enforces
   compliance/pricing invariants, and DELETES a partial artifact on a
@@ -281,7 +284,7 @@ asks for good judgment; the chain guarantees the floor.
 
 | Module | `@pre_compose` pulls | `@chain` floor (LLM can't waive) | `@compose` |
 |---|---|---|---|
-| `pricing_configurator_agent` | practice-area rate card + RFP budget bounds (store) | **recomputes `total_cents` from line items**, recomputes `within_band`, computes the **approval tiers** (`requires_partner_signoff` >$1M, `requires_practice_lead_signoff` >20% discount) — the `can_call` edges route on these computed flags | approver gate gets a focused brief; contracts review gets the full package |
+| `pricing_configurator_agent` | practice-area rate card + RFP budget bounds (store) | **recomputes `total_cents` from line items**, recomputes `within_band`, computes the **approval tiers** (`requires_partner_signoff` >$1M, `requires_practice_lead_signoff` >20% discount) — the `can_call` edges route on these computed flags | decision-maker gate gets a focused brief; contracts review gets the full package |
 | `bid_no_bid_decisioner_agent` | practice-area win/loss history + RFP (store) | **recomputes weighted `overall_score`**, recomputes `recommendation` from firm thresholds, **forces `requires_partner_review`** on no_bid / low confidence / weak score (no silent no-bid) | — |
 | `rfp_intake_agent` | captured opportunity record — its compliance must-haves + budget (store) | **recomputes `completeness_score`** from the exact rubric, derives `extraction_complete`, **unions the captured compliance must-haves** into `compliance_required` (a compliance obligation is never silently dropped) | — |
 | `precedent_research_agent` | practice-area precedents from the proposal corpus (store) | **drops any candidate without an `engagement_id`** (citation floor — no hallucinated proposals reach the drafter), recomputes `best_match_*` / corpus size / `high_confidence_match` from the surviving matches | — |

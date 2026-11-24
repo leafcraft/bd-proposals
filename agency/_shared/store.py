@@ -448,7 +448,7 @@ def approved_proposal(rfp_id: str) -> dict[str, Any]:
     """The APPROVED proposal package (sections + pricing + compliance
     attestations) for an rfp_id ({} if none). PROD: DMS / proposal-
     authoring system read. Used by proposal_assembler_agent to recover the
-    approved content after the HITL gate drops upstream_yields."""
+    approved content after the human step drops upstream_yields."""
     if not rfp_id:
         return {}
     return _seeded("approved_proposals", _APPROVED_PROPOSAL_SEED).get(rfp_id, {})
@@ -584,7 +584,7 @@ def read_boilerplate(kind: str = "terms") -> dict[str, Any]:
     return {"available": True, "kind": kind, "content": value}
 
 
-# ── Which RFP a session is about (survives the human gates) ──────────
+# ── Which RFP a session is about (survives the human steps) ──────────
 #    A human seat's reply carries only the verdict, so the agents behind a
 #    gate (contracts review after a partner / practice-lead approval, the
 #    assembler after the writer) recover the rfp_id from here. Persisted: an

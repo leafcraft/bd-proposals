@@ -19,9 +19,9 @@ carries a **timezone**. A seeded dev store + self-announcing tools let the
 whole pod run on day 0 with no connectors wired.
 
 **The discipline, in one line: agents produce, humans decide, systems
-record — and silence never advances anything** (if nobody answers a gate
-in time, its Inbox card closes and the ticket records that no reply came;
-nothing is approved or sent, and nobody is chased automatically).
+record — and silence never advances anything** (if nobody answers
+in time, its default reply, `hold`, is recorded in the audit log; nothing is
+approved or sent, and nobody is chased automatically).
 
 ## Story
 
@@ -80,7 +80,7 @@ every subsequent proposal cheaper to produce.
 Three tiers. Copy `env` to `.env` and fill in by tier.
 
 **Tier 1 — Boot (required).** The mesh will not run without these.
-- `LEAFMESH_LICENSE_KEY` — required by the SDK to start.
+- `LEAFMESH_LICENSE_KEY` — Not kept in `.env`: `create-leafmesh --start` (or `--load`) asks for it once at the first start to sign this environment in (leafmesh 2.4.538+).
 - `OPENAI_API_KEY` — the `gpt-4o-mini` roles (intake, precedent, pricing,
   bid/no-bid).
 - `ANTHROPIC_API_KEY` — the `claude-sonnet-4-6` roles (section drafter,
@@ -191,20 +191,20 @@ approved package for `RFP-2026-08813` prices 250 days at the rate card
 
 | Agent | Role (human job title) | Responsibilities | Can perform |
 |---|---|---|---|
-| `bd_coordinator_agent` | Pursuit Coordinator | Owns each RFP pursuit end to end; opens the case, orchestrates the pod, keeps live status, is BD's single point of contact | LLM (pure YAML); opens the pursuit → intake, routes escalations to the partner; **never scores, drafts, prices, or reviews itself** |
+| `bd_coordinator_agent` | Pursuit Coordinator | Owns each RFP pursuit end to end; opens the case, orchestrates the pod, keeps live status, is BD's single point of contact | LLM (pure YAML) + **`open_pursuit` / `status` / `escalate` playbook** (on-demand craft); opens the pursuit → intake, routes escalations to the partner; **never scores, drafts, prices, or reviews itself** |
 | `opportunity_feed_agent` | Capture-tool scout | Pulls new, pre-deduplicated, fit-scored RFP notices from the firm's GovWin / SAM.gov / FedConnect saved searches | Programmatic; **fans out across 2 parallel copies** (`scaling.copies.count: 2`), each claiming a disjoint batch (atomic claim); **live daily cron** (`America/New_York`); dev-store fallback that announces `available:false`; routes high-fit finds to the partner, else the audit log |
-| `rfp_intake_agent` | Opportunity-intake specialist | Normalises an inbound RFP (client, practice area, due date, budget) AND extracts structured requirements from attachments with must/should/may classification + completeness scoring | `gpt-4o-mini` over `rfp_templates` knowledge; routes deal-breakers / incomplete extraction to the partner, clean packages to precedent research |
-| `precedent_research_agent` | Precedent researcher | Retrieves similar prior wins and the top proposal-library matches as RAG context for drafting; never invents proposals retrieval didn't return | `gpt-4o-mini` over `proposals_library` (the firm's DMS); hands the corpus to the section drafter |
+| `rfp_intake_agent` | Opportunity-intake specialist | Normalises an inbound RFP (client, practice area, due date, budget) AND extracts structured requirements from attachments with must/should/may classification + completeness scoring | `gpt-4o-mini` over `rfp_templates` knowledge + **`normalise_rfp` / `extract_requirements` playbook** (on-demand craft); routes deal-breakers / incomplete extraction to the partner, clean packages to precedent research |
+| `precedent_research_agent` | Precedent researcher | Retrieves similar prior wins and the top proposal-library matches as RAG context for drafting; never invents proposals retrieval didn't return | `gpt-4o-mini` over `proposals_library` (the firm's DMS) + **`similar_wins` / `corpus_matches` playbook** (on-demand craft); hands the corpus to the section drafter |
 | `section_drafter_agent` | Proposal drafter | Plans and writes each required section (exec summary, approach, team bios, timeline, case studies) citing past proposals | `claude-sonnet-4-6` **super-agent** (plan → draft → verify, bounded by cost/wall-clock) + **`draft_sections` playbook** (on-demand craft) + day-0 **tools** (reusable prose / boilerplate) + commented DMS `mcp`; hands the draft to pricing |
-| `pricing_configurator_agent` | Pricing configurator | Builds line-item pricing against the rate card; a `@chain` floor recomputes the total from the line items and computes the approval tiers (the LLM can't dodge a sign-off) | `gpt-4o-mini` over `rate_cards` + `@pre_compose`/`@chain` floor; routes on the computed flags: >$1M → partner, >20% discount → practice lead, else → contracts review |
-| `contracts_review_agent` | Contracts reviewer | Regulatory/legal fit review of the package (regulatory mode) AND clause-by-clause playbook review of a draft contract (playbook mode) | `claude-sonnet-4-6` over `contract_playbook`; hard legal gate on any unacceptable clause / blocked clearance, deal-desk gate to practice lead, clean packages to the proposal writer |
+| `pricing_configurator_agent` | Pricing configurator | Builds line-item pricing against the rate card; a `@chain` floor recomputes the total from the line items and computes the approval tiers (the LLM can't dodge a sign-off) | `gpt-4o-mini` over `rate_cards` + **`build_breakdown` / `band_check` playbook** (on-demand craft) + `@pre_compose`/`@chain` floor; routes on the computed flags: >$1M → partner, >20% discount → practice lead, else → contracts review |
+| `contracts_review_agent` | Contracts reviewer | Regulatory/legal fit review of the package (regulatory mode) AND clause-by-clause playbook review of a draft contract (playbook mode) | `claude-sonnet-4-6` over `contract_playbook` + **`regulatory_review` / `clause_review` / `partner_briefing` playbook** (on-demand craft); hard legal gate on any unacceptable clause / blocked clearance, deal-desk gate to practice lead, clean packages to the proposal writer |
 | `bid_no_bid_decisioner_agent` | Bid/no-bid strategist | Scores RFP fit on five axes → bid / qualify further / no-bid; never silently no-bids on a weak signal | `gpt-4o-mini` over `rfp_decision_playbook` + a **`win_themes` playbook** (on-demand craft) + `@chain` decision floor; routes low-confidence to the partner, a "bid" verdict to the section drafter |
-| `competitive_intel_agent` | Competitive-intelligence analyst | Runs win/loss post-mortems and quarterly reviews; surfaces competitor signals and learnings | `claude-sonnet-4-6` over `win_loss_archive`; briefs the practice lead, auto-forwards surfaced signals to the CRM ledger |
+| `competitive_intel_agent` | Competitive-intelligence analyst | Runs win/loss post-mortems and quarterly reviews; surfaces competitor signals and learnings | `claude-sonnet-4-6` over `win_loss_archive` + **`post_mortem` / `competitor_signals` playbook** (on-demand craft); briefs the practice lead, auto-forwards surfaced signals to the CRM ledger |
 | `competitor_signal_ledger_agent` | Competitor-signal registrar | Ingests one competitor signal into / queries signals from the firm's CRM intel store (ingest / query modes) | n8n connector against the CRM; writes the result to the audit log on success |
-| `proposal_writer_human` | Proposal writer | Final polish and approve/send of the proposal | Human gate (2 h; nothing is sent on silence); an approval routes to the assembler (finisher), which re-checks it |
-| `practice_lead_human` | Practice lead | Discount sign-off (> 20%) and contracts needing review | Human gate (4 h); `approve` on a quote → contracts review; `reprice` → pricing (a **bounded** back-edge, 2 laps then the partner); anything else → audit |
-| `legal_human` | Legal counsel | Compliance / IP / regulator review on any hard-gated package | Human gate (6 h); the decision is recorded → audit (a fixed package is re-run from contracts review) |
-| `partner_human` | Partner | Sign-off on quotes over $1,000,000, deal-breakers, high-fit finds, bid/no-bid calls | Human gate (8 h); `approve` on a quote → contracts review; anything else → audit; also the Manager's escalation target |
+| `proposal_writer_human` | Proposal writer | Final polish and approve/send of the proposal | Human step (2 h; nothing is sent on silence); an approval routes to the assembler (finisher), which re-checks it |
+| `practice_lead_human` | Practice lead | Discount sign-off (> 20%) and contracts needing review | Human step (4 h); `approve` on a quote → contracts review; `reprice` → pricing (a **bounded** back-edge, 2 laps then the partner); anything else → audit |
+| `legal_human` | Legal counsel | Compliance / IP / regulator review on any hard-gated package | Human step (6 h); the decision is recorded → audit (a fixed package is re-run from contracts review) |
+| `partner_human` | Partner | Sign-off on quotes over $1,000,000, deal-breakers, high-fit finds, bid/no-bid calls | Human step (8 h); `approve` on a quote → contracts review; anything else → audit; also the Manager's escalation target |
 | `proposal_assembler_agent` | Proposal assembler (the finisher) | Renders the APPROVED package into a real document at `./out` | Programmatic **finisher**: approve-token re-check (allow/deny lists, fail closed) → compliance/pricing invariants → render PDF/Markdown → **delete-on-block** → dev-store recovery across the HITL boundary; terminus → audit |
 | `bd_audit_logger_agent` | Audit registrar | Appends every terminal hop to a hash-chained, append-only (WORM) audit trail | Custom external sink → `./logs/bd_audit.jsonl` (swap for S3 Object Lock / Splunk / Datadog in prod); terminal |
 
@@ -214,8 +214,15 @@ bad request, credit, bad config), when 3 different agents fail in one
 session, or when restarts run out. A hand-off that misses its contract
 raises an alert, not an escalation. It does **not** chase an unanswered
 gate: if nobody answers in time (writer 2 h, practice lead 4 h, legal 6 h,
-partner 8 h), the Inbox card closes and the ticket records that no reply
-came — nothing advances.
+partner 8 h), the seat's default reply, `hold`, goes to the audit log —
+nothing advances.
+
+The Inbox has no buttons. Each person types a reply, and a small reply reader
+(`gpt-4o-mini`) turns it into a `verdict` from that seat's list (for example
+`approve`, `reprice` or `hold`). Anything that is not a clear yes reads as
+`hold` and goes to the audit log. If the person answered an agent's question
+instead of deciding, the verdict is `answer` and it goes back to only the
+agent that asked.
 
 See **PRD.md** for the flow diagram, per-agent specs, data artifacts, and
 design decisions.

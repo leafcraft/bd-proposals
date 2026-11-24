@@ -40,7 +40,7 @@ _DEFAULTS: dict[str, Any] = {
     "best_match_similarity": 0,
     "total_corpus_size": 0,
     "high_confidence_match": False,
-    "reason": "",
+    "no_match_reason": "",
 }
 
 
@@ -156,8 +156,8 @@ async def enforce_citation_floor(result: dict, ctx: dict) -> dict[str, Any]:
     result["high_confidence_match"] = bool(
         result["best_match_similarity"] >= _HIGH_CONFIDENCE_MIN
     )
-    if not result.get("reason") and not corpus:
-        result["reason"] = "no_query"
+    if not result.get("no_match_reason") and not corpus:
+        result["no_match_reason"] = "no_query"
 
     logger.info(
         f"enforce_citation_floor — cited={len(cited)} matches={len(matches)} "
@@ -186,7 +186,7 @@ async def precedent_research_agent(llm_response, input_data: dict,
         "best_match_similarity": _clamp01(parsed.get("best_match_similarity", 0)),
         "total_corpus_size": int(parsed.get("total_corpus_size", 0)) if str(parsed.get("total_corpus_size", "")).isdigit() else 0,
         "high_confidence_match": bool(parsed.get("high_confidence_match", False)),
-        "reason": str(parsed.get("reason", "")),
+        "no_match_reason": str(parsed.get("no_match_reason", "")),
     }
     logger.info(
         "precedent_research_agent — surfaced picks (enforce_citation_floor "

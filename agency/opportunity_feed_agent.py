@@ -66,7 +66,7 @@ async def opportunity_feed_agent(llm_response: Any, input_data: dict, context: d
         logger.info(f"[opportunity_feed] no notices to claim — {claim.get('reason')}")
         return {
             "available": False,
-            "reason": str(claim.get("reason", "")),
+            "unavailable_reason": str(claim.get("reason", "")),
             "discovered_count": 0,
             "discovered_rfps": [],
             "high_fit_count": 0,
@@ -86,7 +86,7 @@ async def opportunity_feed_agent(llm_response: Any, input_data: dict, context: d
     )
     return {
         "available": True,
-        "reason": "",
+        "unavailable_reason": "",
         "discovered_count": len(claimed),
         "discovered_rfps": claimed,
         "high_fit_count": len(high_fit),
